@@ -1,0 +1,28 @@
+
+# Virtual environment
+.venv/
+
+# Data and features (too large for git)
+data/
+*.h5
+*.csv
+*.tar.gz
+
+# Model weights
+*.pt
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Results (keep json summaries but not model weights)
+results/*.pt
