@@ -3,9 +3,7 @@
 .venv/
 
 # Data and features (too large for git)
-data/
 *.h5
-*.csv
 *.tar.gz
 
 # Model weights
