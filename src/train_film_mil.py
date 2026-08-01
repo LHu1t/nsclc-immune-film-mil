@@ -165,7 +165,7 @@ class FiLMDataset(Dataset):
             log.info(f"  {subtype} feature index: {len(index)} unique patient barcodes")
 
         # Match rows to h5 files
-        # Note: Subtype label is inferred from *which feature directory
+        # Note: Subtype label is inferred from feature directory
         records = []
         raw_gene_cols = [g + "_raw" for g in gene_cols
                          if g + "_raw" in df.columns]
@@ -217,7 +217,15 @@ class FiLMDataset(Dataset):
         rec = self.records[idx]
 
         with h5py.File(rec["h5_path"], "r") as f:
-            features = torch.tensor(f["features"][:], dtype=torch.float32)  # (N, 1536)
+            features = torch.tensor(f["features"][:], dtype=torch.float32)  # expected (N, 1536)
+
+        if features.ndim == 3 and features.shape[0] == 1:
+            features = features.squeeze(0)
+        elif features.ndim != 2:
+            raise ValueError(
+                f"Unexpected features shape {tuple(features.shape)} in "
+                f"{rec['h5_path']} - expected (N_tiles, feat_dim)."
+            )
 
         # Tile sampling
         n = features.shape[0]
@@ -264,6 +272,10 @@ class AttentionMIL(nn.Module):
         features : (N_tiles, feat_dim)
         returns  : slide_embed (512,), attn_weights (N_tiles,)
         """
+        assert features.ndim == 2, (
+            f"AttentionMIL expects (N_tiles, feat_dim), got shape "
+            f"{tuple(features.shape)}"
+        )
         projected = self.feat_proj(features)            # (N, 512)
         raw_attn  = self.attention(features)            # (N, 1)
         attn      = torch.softmax(raw_attn, dim=0)     # (N, 1)  sums to 1
