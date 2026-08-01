@@ -4,6 +4,7 @@
 
 # Data and features (too large for git)
 *.h5
+*.json
 *.tar.gz
 
 # Model weights

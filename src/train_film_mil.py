@@ -119,46 +119,6 @@ def load_metadata(gene_csv: str):
 
     clinical_cols = ["age_years_z", "gender_encoded"]
 
-    # Derive cancer_type (LUAD / LUSC) from primary diagnosis
-    LUAD_DIAGNOSES = {
-        "adenocarcinoma, nos",
-        "adenocarcinoma with mixed subtypes",
-        "acinar cell carcinoma",
-        "papillary adenocarcinoma, nos",
-        "bronchiolo-alveolar carcinoma, non-mucinous",
-        "mucinous adenocarcinoma",
-        "bronchio-alveolar carcinoma, mucinous",
-        "bronchiolo-alveolar adenocarcinoma, nos",
-        "invasive micropapillary carcinoma",
-        "solid carcinoma, nos",
-    }
-    LUSC_DIAGNOSES = {
-        "squamous cell carcinoma, nos",
-        "basaloid squamous cell carcinoma",
-        "squamous cell carcinoma, keratinizing, nos",
-        "papillary squamous cell carcinoma",
-        "squamous cell carcinoma, large cell, nonkeratinizing, nos",
-        "squamous cell carcinoma, small cell, nonkeratinizing",
-        "squamous cell carcinoma, clear cell type",
-    }
-
-    def map_subtype(diag):
-        d = str(diag).strip().lower()
-        if d in LUAD_DIAGNOSES:
-            return "LUAD"
-        elif d in LUSC_DIAGNOSES:
-            return "LUSC"
-        return None
-
-    df["cancer_type"] = df["diagnoses.0.primary_diagnosis"].apply(map_subtype)
-    before = len(df)
-    df = df[df["cancer_type"].notna()].reset_index(drop=True)
-    log.info(
-        f"Subtype assignment: {(df['cancer_type']=='LUAD').sum()} LUAD, "
-        f"{(df['cancer_type']=='LUSC').sum()} LUSC "
-        f"({before - len(df)} rows dropped — unrecognised diagnosis)"
-    )
-
     return df, gene_cols, clinical_cols, y_means, y_stds
 
 
@@ -205,17 +165,28 @@ class FiLMDataset(Dataset):
             log.info(f"  {subtype} feature index: {len(index)} unique patient barcodes")
 
         # Match rows to h5 files
+        # Note: Subtype label is inferred from *which feature directory
         records = []
         raw_gene_cols = [g + "_raw" for g in gene_cols
                          if g + "_raw" in df.columns]
+        n_ambiguous = 0
         for _, row in df.iterrows():
-            sid     = row["submitter_id"] # 12-char: TCGA-XX-YYYY
-            subtype = row.get("cancer_type", None)
-            if subtype not in self.feature_dirs:
+            sid = row["submitter_id"] # 12-char: TCGA-XX-YYYY
+
+            found = {
+                subtype: index[sid]
+                for subtype, index in self.barcode_index.items()
+                if sid in index
+            }
+
+            if len(found) == 0:
                 continue
-            h5_path = self.barcode_index[subtype].get(sid)
-            if h5_path is None:
+            if len(found) > 1:
+                # Same patient barcode present in more than one feature directory, so skip
+                n_ambiguous += 1
                 continue
+
+            subtype, h5_path = next(iter(found.items()))
             rec = {
                 "sid":      sid,
                 "subtype":  subtype,
@@ -231,6 +202,10 @@ class FiLMDataset(Dataset):
             records.append(rec)
 
         self.records = records
+        if n_ambiguous:
+            log.warning(f"  Skipped {n_ambiguous} patient(s) found in "
+                        f"BOTH LUAD and LUSC feature directories "
+                        f"(subtype could not be determined unambiguously)")
         log.info(f"Dataset: {len(records)} matched slides "
                  f"(LUAD: {sum(1 for r in records if r['subtype']=='LUAD')}, "
                  f"LUSC: {sum(1 for r in records if r['subtype']=='LUSC')})")
@@ -496,7 +471,17 @@ def compute_auc(all_preds: np.ndarray, all_labels: np.ndarray,
 def run_epoch(model, loader, loss_fn, optimizer, epoch, device, training=True):
     model.train() if training else model.eval()
     total_loss = 0.0
-    all_preds, all_labels = [], []
+    all_preds, all_labels = [], []      # detached copies, for metrics/return only
+    batch_preds, batch_labels = [], []
+
+    def _step(preds_list, labels_list):
+        pred_batch  = torch.stack(preds_list)
+        label_batch = torch.stack(labels_list)
+        loss, _ = loss_fn(pred_batch, label_batch, epoch)
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
 
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
@@ -511,23 +496,25 @@ def run_epoch(model, loader, loss_fn, optimizer, epoch, device, training=True):
 
             pred, _ = model(features, clinical, subtype_id)  # (35,)
 
-            # Accumulate for batch-level PCC loss (need multiple samples)
+            # Detached copies for logging / PCC metrics
             all_preds.append(pred.detach().cpu())
             all_labels.append(label.detach().cpu())
 
-            # Per-sample MSE contribution to total loss
+            # Per-sample MSE contribution to total loss (metrics only)
             mse = F.mse_loss(pred, label)
             total_loss += mse.item()
 
-            if training and len(all_preds) % 16 == 0:
-                # Compute composite loss over accumulated batch every 16 slides
-                pred_batch  = torch.stack(all_preds[-16:]).to(device)
-                label_batch = torch.stack(all_labels[-16:]).to(device)
-                loss, _ = loss_fn(pred_batch, label_batch, epoch)
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+            if training:
+                batch_preds.append(pred)
+                batch_labels.append(label)
+
+                if len(batch_preds) % 16 == 0:
+                    _step(batch_preds, batch_labels)
+                    batch_preds, batch_labels = [], []
+
+        # Note: This flushes any leftover slides (< 16) so the tail of the epoch still contributes a gradient update instead of being ignored
+        if training and batch_preds:
+            _step(batch_preds, batch_labels)
 
     preds  = torch.stack(all_preds).numpy()
     labels = torch.stack(all_labels).numpy()
