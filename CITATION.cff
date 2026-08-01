@@ -1,0 +1,9 @@
+cff-version: 1.0.0
+message: "If you use this, please cite it as below."
+authors:
+- family-names: "Huitema"
+  given-names: "Lucas"
+- family-names: "Boucher"
+  given-names: "Thomas"
+title: "FiLM-Conditioned Attention-Based MIL Reveals Subtype-Specific Morphological Encoding of Antigen Presentation and T-Cell Inflammation in NSCLC"
+url: "https://github.com/LHu1t/nsclc-immune-film-mil"

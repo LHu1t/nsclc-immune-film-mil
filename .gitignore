@@ -4,8 +4,14 @@
 
 # Data and features (too large for git)
 *.h5
-*.json
+data/raw/tcga-luad/*.json
+data/raw/tcga-lusc/*.json
 *.tar.gz
+
+# Figures
+figures/*.png
+figures/*.pdf
+figures/*.csv
 
 # Model weights
 *.pt
