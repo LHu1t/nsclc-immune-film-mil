@@ -1,0 +1,14 @@
+{
+  "n_folds_loaded": 5,
+  "n_test_patients": 330,
+  "tcga_vs_cptac_ensemble": {
+    "APM": {
+      "TCGA": 0.5964123606681824,
+      "CPTAC": 0.32468613945434793
+    },
+    "TIS": {
+      "TCGA": 0.7259935140609741,
+      "CPTAC": 0.49099150760664234
+    }
+  }
+}

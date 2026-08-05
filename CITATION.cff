@@ -5,5 +5,7 @@ authors:
   given-names: "Lucas"
 - family-names: "Boucher"
   given-names: "Thomas"
+- family-names: "Mazomenos"
+  given-names: "Evangelos"
 title: "FiLM-Conditioned Attention-Based MIL Reveals Subtype-Specific Morphological Encoding of Antigen Presentation and T-Cell Inflammation in NSCLC"
 url: "https://github.com/LHu1t/nsclc-immune-film-mil"

@@ -44,19 +44,37 @@ FOLD_CMAP      = plt.cm.viridis
 
 # Loading helpers
 def load_artifacts(artifacts_dir: Path):
+    results_path = (
+        artifacts_dir / "results.json"
+        if (artifacts_dir / "results.json").exists()
+        else artifacts_dir / "cptac_results_summary.json"
+    )
+
+    bootstrap_path = (
+        artifacts_dir / "ensemble_test_predictions.npz"
+        if (artifacts_dir / "ensemble_test_predictions.npz").exists()
+        else artifacts_dir / "cptac_bootstrap_stats.json"
+    )
+
+    ensemble_predictions_path = (
+        artifacts_dir / "ensemble_test_predictions.npz"
+        if (artifacts_dir / "ensemble_test_predictions.npz").exists()
+        else artifacts_dir / "ensemble_cptac_predictions.npz"
+    )
+    
     with open(artifacts_dir / "model_config.json") as f:
         config = json.load(f)
-    with open(artifacts_dir / "bootstrap_permutation_stats.json") as f:
+    with open(bootstrap_path) as f:
         boot_stats = json.load(f)
-    with open(artifacts_dir / "results.json") as f:
+    with open(results_path) as f:
         results = json.load(f)
 
     fold_npz = {}
-    for p in sorted(artifacts_dir.glob("fold*_test_predictions.npz")):
+    for p in sorted(artifacts_dir.glob("fold*_test_predictions.npz")) or sorted(artifacts_dir.glob("fold*_cptac_predictions.npz")):
         fold = int(p.stem.split("fold")[1].split("_")[0])
         fold_npz[fold] = np.load(p, allow_pickle=True)
 
-    ensemble = np.load(artifacts_dir / "ensemble_test_predictions.npz", allow_pickle=True)
+    ensemble = np.load(ensemble_predictions_path, allow_pickle=True)
 
     return config, boot_stats, results, fold_npz, ensemble
 

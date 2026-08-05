@@ -6,12 +6,19 @@
 *.h5
 data/raw/tcga-luad/*.json
 data/raw/tcga-lusc/*.json
+data/raw/cptac-luad-part1/*.json
+data/raw/cptac-luad-part2/*.json
+data/raw/cptac-lusc/*.json
 *.tar.gz
 
 # Figures
-figures/*.png
-figures/*.pdf
-figures/*.csv
+figures/cptac/*.png
+figures/cptac/*.pdf
+figures/cptac/*.csv
+
+figures/tcga/*.png
+figures/tcga/*.pdf
+figures/tcga/*.csv
 
 # Model weights
 *.pt
@@ -30,4 +37,8 @@ __pycache__/
 .DS_Store
 
 # Results (keep json summaries but not model weights)
-results/*.pt
+results/training/*.pt
+results/external_validation/*.pt
+
+# Verification scripts
+src/hidden-verification/*.py
