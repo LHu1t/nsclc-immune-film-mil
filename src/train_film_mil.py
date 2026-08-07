@@ -30,6 +30,7 @@ Usage:
         --metadata      /path/to/metadata.csv \
         --output_dir    ./results \
         --n_folds       5
+        --film_enabled  (true or false)
 
 File structure expected in feature directories:
     <luad_features>/<submitter_id>.h5   (keys: features, coords)
@@ -328,10 +329,11 @@ class FiLMMILModel(nn.Module):
     End-to-end FiLM-conditioned Attention-MIL model.
 
     Pipeline:
-        1. Attention-MIL: (N_tiles, 1536) -> (512,) slide embedding
-        2. FiLM:          condition slide embedding on subtype (LUAD/LUSC)
-        3. Clinical:      project [age_z, gender] -> (64,), concatenate
-        4. Regression:    (512+64,) -> (n_genes,)
+        1. Check if FiLM conditioning is enabled
+        2. Attention-MIL: (N_tiles, 1536) -> (512,) slide embedding
+        3. FiLM:          condition slide embedding on subtype (LUAD/LUSC)
+        4. Clinical:      project [age_z, gender] -> (64,), concatenate
+        5. Regression:    (512+64,) -> (n_genes,)
     """
     def __init__(
         self,
@@ -342,22 +344,28 @@ class FiLMMILModel(nn.Module):
         n_genes:      int = 35,
         n_subtypes:   int = 2,
         dropout:      float = 0.25,
+        *,
+        use_film:     bool,
     ):
         super().__init__()
 
-        # 1. Attention-MIL pooling
+        #1. Check if FiLM conditioning is enabled
+        self.use_film = use_film
+
+        # 2. Attention-MIL pooling
         self.attention_mil = AttentionMIL(feat_dim=feat_dim, hidden_dim=256)
 
-        # 2. FiLM subtype conditioning
-        self.film = FiLMLayer(embed_dim=embed_dim, n_subtypes=n_subtypes)
+        # 3. FiLM subtype conditioning
+        if self.use_film:
+            self.film = FiLMLayer(embed_dim=embed_dim, n_subtypes=n_subtypes)
 
-        # 3. Clinical projection
+        # 4. Clinical projection
         self.clinical_proj = nn.Sequential(
             nn.Linear(clinical_dim, n_clinical),
             nn.ReLU(),
         )
 
-        # 4. Regression head
+        # 5. Regression head
         self.head = nn.Sequential(
             nn.Linear(embed_dim + n_clinical, 256),
             nn.ReLU(),
@@ -377,7 +385,8 @@ class FiLMMILModel(nn.Module):
         slide_embed, attn_weights = self.attention_mil(features)  # (512,), (N,)
 
         # 2. FiLM conditioning on subtype
-        slide_embed = self.film(slide_embed, subtype_id)          # (512,)
+        if self.use_film:
+            slide_embed = self.film(slide_embed, subtype_id)          # (512,)
 
         # 3. Clinical covariates
         clin_embed  = self.clinical_proj(clinical)                # (64,)
@@ -598,7 +607,7 @@ def train(args):
         test_loader  = DataLoader(test_ds,  batch_size=1, shuffle=False, num_workers=4)
 
         # Model
-        model    = FiLMMILModel(feat_dim=1536, n_genes=len(gene_cols)).to(device)
+        model    = FiLMMILModel(feat_dim=1536, n_genes=len(gene_cols), use_film=args.use_film).to(device)
         loss_fn  = CompositeLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -682,6 +691,7 @@ def train(args):
                 for i, g in enumerate(gene_cols)
             },
             "subtype":        subtype_results,
+            "use_film": args.use_film,
         }
         fold_results.append(fold_result)
 
@@ -733,6 +743,8 @@ def parse_args():
     p.add_argument("--max_epochs",    type=int, default=200)
     p.add_argument("--patience",      type=int, default=10,
                    help="Early stopping patience (epochs without val PCC improvement)")
+    p.add_argument("--use_film",
+                   help="Enable FiLM subtype conditioning.")
     return p.parse_args()
 
 
