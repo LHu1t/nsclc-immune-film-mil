@@ -1,0 +1,7 @@
+split,subtype,n,age_mean,age_sd,sex_counts,stage_counts
+Test,LUAD,197,67.89233436523902,8.66568457357496,"{'male': 126, 'female': 71}","{'Stage I': 85, 'Stage II': 39, 'Stage III': 27, 'Stage IV': 4}"
+Test,LUSC,197,67.89233436523902,8.66568457357496,"{'male': 126, 'female': 71}","{'Stage I': 85, 'Stage II': 39, 'Stage III': 27, 'Stage IV': 4}"
+Dev (train+val),LUAD,790,66.58860846134517,9.10053709603476,"{'male': 462, 'female': 328}","{'Stage I': 329, 'Stage II': 186, 'Stage III': 96, 'Stage IV': 22}"
+Dev (train+val),LUSC,790,66.58860846134517,9.10053709603476,"{'male': 462, 'female': 328}","{'Stage I': 329, 'Stage II': 186, 'Stage III': 96, 'Stage IV': 22}"
+Full cohort,LUAD,987,66.84882528309502,9.026176318257274,"{'male': 588, 'female': 399}","{'Stage I': 414, 'Stage II': 225, 'Stage III': 123, 'Stage IV': 26}"
+Full cohort,LUSC,987,66.84882528309502,9.026176318257274,"{'male': 588, 'female': 399}","{'Stage I': 414, 'Stage II': 225, 'Stage III': 123, 'Stage IV': 26}"

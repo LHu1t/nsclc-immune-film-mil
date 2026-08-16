@@ -73,6 +73,9 @@ TIS_GENES = [
 ]
 SUBTYPE_MAP = {"LUAD": 0, "LUSC": 1}
 
+# Literal pre-computed panel-score columns in the metadata CSV (if present), used as ground truth for the direct APM/TIS head (see PanelHead below). These are distinct from APM_GENES / TIS_GENES, which are the individual genes used for the "mean-of-predicted-genes" panel PCC.
+PANEL_TARGETS = ["APM", "TIS"]
+
 
 # Metadata loading
 def load_metadata(gene_csv: str):
@@ -120,7 +123,17 @@ def load_metadata(gene_csv: str):
 
     clinical_cols = ["age_years_z", "gender_encoded"]
 
-    return df, gene_cols, clinical_cols, y_means, y_stds
+    # Locate the literal pre-computed APM/TIS panel-score columns (if the CSV provides them) within gene_cols, so the direct panel head can be supervised against and evaluated against the *true* panel scores rather than the mean of individually-predicted genes.
+    panel_idx = {name: gene_cols.index(name) for name in PANEL_TARGETS if name in gene_cols}
+    missing_panels = [name for name in PANEL_TARGETS if name not in panel_idx]
+    if missing_panels:
+        log.warning(
+            f"  Metadata CSV has no literal column(s) {missing_panels} for the "
+            f"direct panel head. Add pre-computed APM/TIS score columns to the "
+            f"CSV to evaluate the head against true panel scores."
+        )
+
+    return df, gene_cols, clinical_cols, y_means, y_stds, panel_idx
 
 
 # Dataset
@@ -334,6 +347,7 @@ class FiLMMILModel(nn.Module):
         3. FiLM:          condition slide embedding on subtype (LUAD/LUSC)
         4. Clinical:      project [age_z, gender] -> (64,), concatenate
         5. Regression:    (512+64,) -> (n_genes,)
+        6. Panel head:    (512+64,) -> (2,)  [APM, TIS] direct prediction, a separate small head from the 35-gene head above, so APM/TIS can be evaluated either as the mean of the individually-predicted genes (existing metric) or as this head's direct output (new metric).
     """
     def __init__(
         self,
@@ -345,12 +359,14 @@ class FiLMMILModel(nn.Module):
         n_subtypes:   int = 2,
         dropout:      float = 0.25,
         *,
-        use_film:     bool,
+        use_film:      bool,
+        use_panel_head: bool = True,
     ):
         super().__init__()
 
         #1. Check if FiLM conditioning is enabled
         self.use_film = use_film
+        self.use_panel_head = use_panel_head
 
         # 2. Attention-MIL pooling
         self.attention_mil = AttentionMIL(feat_dim=feat_dim, hidden_dim=256)
@@ -365,7 +381,7 @@ class FiLMMILModel(nn.Module):
             nn.ReLU(),
         )
 
-        # 5. Regression head
+        # 5. Regression head (35 individual gene/TMB targets)
         self.head = nn.Sequential(
             nn.Linear(embed_dim + n_clinical, 256),
             nn.ReLU(),
@@ -373,13 +389,23 @@ class FiLMMILModel(nn.Module):
             nn.Linear(256, n_genes),
         )
 
+        # 6. Direct APM/TIS panel head — a separate, smaller MLP off the same slide embedding, trained to directly regress the two panel scores rather than deriving them from individual gene outputs.
+        if self.use_panel_head:
+            self.panel_head = nn.Sequential(
+                nn.Linear(embed_dim + n_clinical, 128),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(128, len(PANEL_TARGETS)),  # [APM, TIS]
+            )
+
     def forward(self, features, clinical, subtype_id):
         """
         features   : (N_tiles, feat_dim)
         clinical   : (clinical_dim,)
         subtype_id : scalar long tensor (0=LUAD, 1=LUSC)
 
-        returns    : predictions (n_genes,), attn_weights (N_tiles,)
+        returns    : predictions (n_genes,), attn_weights (N_tiles,),
+                     panel_preds (2,) or None if use_panel_head=False
         """
         # 1. Attention pooling -> slide embedding
         slide_embed, attn_weights = self.attention_mil(features)  # (512,), (N,)
@@ -395,7 +421,10 @@ class FiLMMILModel(nn.Module):
         combined = torch.cat([slide_embed, clin_embed], dim=-1)  # (576,)
         preds    = self.head(combined)                            # (35,)
 
-        return preds, attn_weights
+        # 5. Direct panel-head prediction (independent of the 35-gene head)
+        panel_preds = self.panel_head(combined) if self.use_panel_head else None  # (2,)
+
+        return preds, attn_weights, panel_preds
 
 
 # Loss function (MSE + PCC + Var)
@@ -424,6 +453,9 @@ class CompositeLoss(nn.Module):
         pred:   torch.Tensor,
         target: torch.Tensor,
         epoch:  int,
+        panel_pred:   torch.Tensor | None = None,
+        panel_target: torch.Tensor | None = None,
+        panel_weight: float = 0.5,
     ) -> tuple[torch.Tensor, dict]:
 
         mse = F.mse_loss(pred, target)
@@ -437,10 +469,22 @@ class CompositeLoss(nn.Module):
 
         loss = alpha * mse + beta * pcc_loss + gamma * var_loss
 
+        panel_mse = None
+        if panel_pred is not None and panel_target is not None:
+            # Same MSE + (1-PCC) composite as the main head, applied to the direct 2-value [APM, TIS] output. Added on top of the main gene-head loss so both heads are trained jointly.
+            panel_mse = F.mse_loss(panel_pred, panel_target)
+            panel_pcc_loss = self.pearson_loss(panel_pred, panel_target)
+            if epoch <= 25:
+                panel_loss = panel_mse
+            else:
+                panel_loss = 0.7 * panel_mse + 0.3 * panel_pcc_loss
+            loss = loss + panel_weight * panel_loss
+
         return loss, {
             "mse":     mse.item(),
             "pcc":     (1 - pcc_loss).item(),
             "var":     (-var_loss).item(),
+            "panel_mse": panel_mse.item() if panel_mse is not None else None,
             "total":   loss.item(),
         }
 
@@ -472,6 +516,21 @@ def compute_panel_pcc(all_preds: np.ndarray, all_labels: np.ndarray,
     return r if not np.isnan(r) else 0.0
 
 
+def compute_panel_head_pcc(all_panel_preds: np.ndarray, all_panel_labels: np.ndarray) -> dict:
+    """
+    Direct-head PCC: correlate the panel head's own [APM, TIS] output
+    against the true APM/TIS values (no averaging of individual genes).
+
+    all_panel_preds, all_panel_labels : (n_samples, 2), columns ordered
+    to match PANEL_TARGETS = ["APM", "TIS"].
+    """
+    results = {}
+    for i, name in enumerate(PANEL_TARGETS):
+        r, _ = pearsonr(all_panel_preds[:, i], all_panel_labels[:, i])
+        results[name] = r if not np.isnan(r) else 0.0
+    return results
+
+
 def compute_auc(all_preds: np.ndarray, all_labels: np.ndarray,
                 gene_cols: list, panel_genes: list,
                 gene_symbol_to_idx: dict) -> float:
@@ -489,16 +548,45 @@ def compute_auc(all_preds: np.ndarray, all_labels: np.ndarray,
 
 
 # Training and evaluation loops
-def run_epoch(model, loader, loss_fn, optimizer, epoch, device, training=True):
+def run_epoch(
+    model, loader, loss_fn, optimizer, epoch, device, training=True,
+    panel_idx: dict | None = None,
+    panel_gene_fallback_idx: dict | None = None,
+):
+    """
+    panel_idx               : {"APM": idx_in_label, "TIS": idx_in_label} for whichever literal panel columns exist in the label vector. Used as the ground truth for the direct panel head.
+    panel_gene_fallback_idx  : {"APM": [gene indices...], "TIS": [...]} used to build a mean-of-genes ground truth for any panel missing from panel_idx.
+    """
     model.train() if training else model.eval()
     total_loss = 0.0
     all_preds, all_labels = [], []      # detached copies, for metrics/return only
+    all_panel_preds, all_panel_labels = [], []
     batch_preds, batch_labels = [], []
+    batch_panel_preds, batch_panel_labels = [], []
 
-    def _step(preds_list, labels_list):
+    panel_idx = panel_idx or {}
+    panel_gene_fallback_idx = panel_gene_fallback_idx or {}
+    use_panel_head = getattr(model, "use_panel_head", False)
+
+    def _panel_target(label: torch.Tensor) -> torch.Tensor:
+        """Build the (2,) [APM, TIS] ground-truth vector for one sample."""
+        vals = []
+        for name in PANEL_TARGETS:
+            if name in panel_idx:
+                vals.append(label[panel_idx[name]])
+            elif name in panel_gene_fallback_idx and panel_gene_fallback_idx[name]:
+                vals.append(label[panel_gene_fallback_idx[name]].mean())
+            else:
+                vals.append(torch.tensor(0.0, device=label.device))
+        return torch.stack(vals)
+
+    def _step(preds_list, labels_list, panel_preds_list, panel_labels_list):
         pred_batch  = torch.stack(preds_list)
         label_batch = torch.stack(labels_list)
-        loss, _ = loss_fn(pred_batch, label_batch, epoch)
+        panel_pred_batch  = torch.stack(panel_preds_list)  if panel_preds_list  else None
+        panel_label_batch = torch.stack(panel_labels_list) if panel_labels_list else None
+        loss, _ = loss_fn(pred_batch, label_batch, epoch,
+                           panel_pred=panel_pred_batch, panel_target=panel_label_batch)
         optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -515,11 +603,17 @@ def run_epoch(model, loader, loss_fn, optimizer, epoch, device, training=True):
             clinical   = clinical.squeeze(0).to(device)    # (2,)
             subtype_id = subtype_id.squeeze(0).to(device)  # scalar
 
-            pred, _ = model(features, clinical, subtype_id)  # (35,)
+            pred, _, panel_pred = model(features, clinical, subtype_id)  # (35,), (2,) or None
 
             # Detached copies for logging / PCC metrics
             all_preds.append(pred.detach().cpu())
             all_labels.append(label.detach().cpu())
+
+            panel_target = None
+            if use_panel_head and panel_pred is not None:
+                panel_target = _panel_target(label)
+                all_panel_preds.append(panel_pred.detach().cpu())
+                all_panel_labels.append(panel_target.detach().cpu())
 
             # Per-sample MSE contribution to total loss (metrics only)
             mse = F.mse_loss(pred, label)
@@ -528,20 +622,27 @@ def run_epoch(model, loader, loss_fn, optimizer, epoch, device, training=True):
             if training:
                 batch_preds.append(pred)
                 batch_labels.append(label)
+                if use_panel_head and panel_pred is not None:
+                    batch_panel_preds.append(panel_pred)
+                    batch_panel_labels.append(panel_target)
 
                 if len(batch_preds) % 16 == 0:
-                    _step(batch_preds, batch_labels)
+                    _step(batch_preds, batch_labels, batch_panel_preds, batch_panel_labels)
                     batch_preds, batch_labels = [], []
+                    batch_panel_preds, batch_panel_labels = [], []
 
         # Note: This flushes any leftover slides (< 16) so the tail of the epoch still contributes a gradient update instead of being ignored
         if training and batch_preds:
-            _step(batch_preds, batch_labels)
+            _step(batch_preds, batch_labels, batch_panel_preds, batch_panel_labels)
 
     preds  = torch.stack(all_preds).numpy()
     labels = torch.stack(all_labels).numpy()
     mean_pcc = compute_gene_pccs(preds, labels).mean()
 
-    return total_loss / len(loader), mean_pcc, preds, labels
+    panel_preds_arr  = torch.stack(all_panel_preds).numpy()  if all_panel_preds  else None
+    panel_labels_arr = torch.stack(all_panel_labels).numpy() if all_panel_labels else None
+
+    return total_loss / len(loader), mean_pcc, preds, labels, panel_preds_arr, panel_labels_arr
 
 
 # Main training script
@@ -553,7 +654,7 @@ def train(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load metadata
-    df, gene_cols, clinical_cols, _, _ = load_metadata(args.metadata)
+    df, gene_cols, clinical_cols, _, _, panel_idx = load_metadata(args.metadata)
 
     # Build gene symbol -> index mapping for panel evaluation.
     # Strips _fpkm_uq suffix and leaves TMB, APM, and TIS unaltered.
@@ -564,6 +665,12 @@ def train(args):
     log.info(f"Predicting {len(gene_cols)} targets: "
              f"{len([g for g in gene_cols if g.endswith('_fpkm_uq')])} genes "
              f"+ TMB + APM + TIS")
+
+    # Fallback ground truth (mean of individual panel genes) for the direct panel head, used only for whichever of APM/TIS has no literal column.
+    panel_gene_fallback_idx = {
+        "APM": [gene_symbol_to_idx[g] for g in APM_GENES if g in gene_symbol_to_idx],
+        "TIS": [gene_symbol_to_idx[g] for g in TIS_GENES if g in gene_symbol_to_idx],
+    }
 
     # Feature directories
     feature_dirs = {
@@ -620,11 +727,13 @@ def train(args):
         patience_ctr  = 0
 
         for epoch in range(1, args.max_epochs + 1):
-            train_loss, train_pcc, _, _ = run_epoch(
-                model, train_loader, loss_fn, optimizer, epoch, device, training=True
+            train_loss, train_pcc, _, _, _, _ = run_epoch(
+                model, train_loader, loss_fn, optimizer, epoch, device, training=True,
+                panel_idx=panel_idx, panel_gene_fallback_idx=panel_gene_fallback_idx,
             )
-            val_loss, val_pcc, _, _ = run_epoch(
-                model, val_loader, loss_fn, optimizer, epoch, device, training=False
+            val_loss, val_pcc, _, _, _, _ = run_epoch(
+                model, val_loader, loss_fn, optimizer, epoch, device, training=False,
+                panel_idx=panel_idx, panel_gene_fallback_idx=panel_gene_fallback_idx,
             )
             scheduler.step(val_loss)
 
@@ -647,18 +756,28 @@ def train(args):
         # Evaluate on held-out test set
         model.load_state_dict(best_weights)
         model.to(device)
-        _, _, test_preds, test_labels = run_epoch(
-            model, test_loader, loss_fn, optimizer, 999, device, training=False
+        _, _, test_preds, test_labels, test_panel_preds, test_panel_labels = run_epoch(
+            model, test_loader, loss_fn, optimizer, 999, device, training=False,
+            panel_idx=panel_idx, panel_gene_fallback_idx=panel_gene_fallback_idx,
         )
 
         # Gene-level PCCs
         gene_pccs = compute_gene_pccs(test_preds, test_labels)
 
         # Panel-level metrics (LUAD + LUSC combined, then subtype-split below)
+        # (A) Mean-of-predicted-genes PCC — existing method: average the model's 18 individual gene predictions, correlate against the average of the 18 true (z-scored) gene values.
         apm_pcc  = compute_panel_pcc(test_preds, test_labels, gene_cols, APM_GENES, gene_symbol_to_idx)
         tis_pcc  = compute_panel_pcc(test_preds, test_labels, gene_cols, TIS_GENES, gene_symbol_to_idx)
         apm_auc  = compute_auc(test_preds, test_labels, gene_cols, APM_GENES, gene_symbol_to_idx)
         tis_auc  = compute_auc(test_preds, test_labels, gene_cols, TIS_GENES, gene_symbol_to_idx)
+
+        # (B) Direct panel-head PCC: the model's own dedicated APM/TIS head, correlated against the true APM/TIS values (literal CSV columns when available, else mean-of-genes as the fallback ground truth — see panel_gene_fallback_idx above).
+        if test_panel_preds is not None:
+            head_pccs = compute_panel_head_pcc(test_panel_preds, test_panel_labels)
+            apm_head_pcc = head_pccs["APM"]
+            tis_head_pcc = head_pccs["TIS"]
+        else:
+            apm_head_pcc = tis_head_pcc = None
 
         # Subtype-split evaluation (your core biological finding)
         luad_mask = np.array([
@@ -671,21 +790,30 @@ def train(args):
             if mask.sum() == 0:
                 continue
             p, l = test_preds[mask], test_labels[mask]
-            subtype_results[name] = {
+            res = {
                 "APM_PCC": compute_panel_pcc(p, l, gene_cols, APM_GENES, gene_symbol_to_idx),
                 "TIS_PCC": compute_panel_pcc(p, l, gene_cols, TIS_GENES, gene_symbol_to_idx),
                 "APM_AUC": compute_auc(p, l, gene_cols, APM_GENES, gene_symbol_to_idx),
                 "TIS_AUC": compute_auc(p, l, gene_cols, TIS_GENES, gene_symbol_to_idx),
                 "n":       int(mask.sum()),
             }
+            if test_panel_preds is not None:
+                head_res = compute_panel_head_pcc(test_panel_preds[mask], test_panel_labels[mask])
+                res["APM_head_PCC"] = head_res["APM"]
+                res["TIS_head_PCC"] = head_res["TIS"]
+            subtype_results[name] = res
 
         fold_result = {
             "fold":           fold,
             "best_val_pcc":   float(best_val_pcc),
+            # Mean-of-predicted-genes panel PCC (existing method)
             "APM_PCC":        float(apm_pcc),
             "TIS_PCC":        float(tis_pcc),
             "APM_AUC":        float(apm_auc),
             "TIS_AUC":        float(tis_auc),
+            # Direct panel-head PCC: head output vs true APM/TIS
+            "APM_head_PCC":   float(apm_head_pcc) if apm_head_pcc is not None else None,
+            "TIS_head_PCC":   float(tis_head_pcc) if tis_head_pcc is not None else None,
             "gene_pccs":      {
                 g.replace("_fpkm_uq", ""): float(gene_pccs[i])
                 for i, g in enumerate(gene_cols)
@@ -696,10 +824,12 @@ def train(args):
         fold_results.append(fold_result)
 
         log.info(f"\nFold {fold} Test Results:")
-        log.info(f"  APM  PCC={apm_pcc:.4f}  AUC={apm_auc:.4f}")
-        log.info(f"  TIS  PCC={tis_pcc:.4f}  AUC={tis_auc:.4f}")
+        log.info(f"  APM  meanGenePCC={apm_pcc:.4f}  headPCC={apm_head_pcc if apm_head_pcc is not None else float('nan'):.4f}  AUC={apm_auc:.4f}")
+        log.info(f"  TIS  meanGenePCC={tis_pcc:.4f}  headPCC={tis_head_pcc if tis_head_pcc is not None else float('nan'):.4f}  AUC={tis_auc:.4f}")
         for name, res in subtype_results.items():
-            log.info(f"  {name} (n={res['n']}): APM PCC={res['APM_PCC']:.4f}, TIS PCC={res['TIS_PCC']:.4f}")
+            log.info(f"  {name} (n={res['n']}): APM meanGenePCC={res['APM_PCC']:.4f}"
+                     f" headPCC={res.get('APM_head_PCC', float('nan')):.4f}, "
+                     f"TIS meanGenePCC={res['TIS_PCC']:.4f} headPCC={res.get('TIS_head_PCC', float('nan')):.4f}")
 
         # Save model weights for this fold
         torch.save(
@@ -711,12 +841,13 @@ def train(args):
     log.info(f"\n{'='*60}")
     log.info("CROSS-VALIDATION SUMMARY")
     log.info(f"{'='*60}")
-    for metric in ["APM_PCC", "TIS_PCC", "APM_AUC", "TIS_AUC"]:
-        vals = [r[metric] for r in fold_results]
-        log.info(f"  {metric}: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
+    for metric in ["APM_PCC", "TIS_PCC", "APM_AUC", "TIS_AUC", "APM_head_PCC", "TIS_head_PCC"]:
+        vals = [r[metric] for r in fold_results if r.get(metric) is not None]
+        if vals:
+            log.info(f"  {metric}: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
 
     for subtype in ["LUAD", "LUSC"]:
-        for metric in ["APM_PCC", "TIS_PCC", "APM_AUC", "TIS_AUC"]:
+        for metric in ["APM_PCC", "TIS_PCC", "APM_AUC", "TIS_AUC", "APM_head_PCC", "TIS_head_PCC"]:
             vals = [r["subtype"][subtype][metric]
                     for r in fold_results if subtype in r["subtype"]]
             if vals:

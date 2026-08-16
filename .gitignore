@@ -20,6 +20,9 @@ figures/tcga/*.png
 figures/tcga/*.pdf
 figures/tcga/*.csv
 
+figures/film_comparison_outputs/*.png
+figures/film_comparison_outputs/*.csv
+
 # Model weights
 *.pt
 *.pth
@@ -37,8 +40,8 @@ __pycache__/
 .DS_Store
 
 # Results (keep json summaries but not model weights)
-results/training/*.pt
-results/external_validation/*.pt
+results/FiLM/training/*.pt
+results/no-FiLM/training/*.pt
 
 # Verification scripts
 src/hidden-verification/*.py
