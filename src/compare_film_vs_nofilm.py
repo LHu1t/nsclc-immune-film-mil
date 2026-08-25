@@ -8,10 +8,17 @@ Two directories, one per run (i.e. two runs of the notebook with FILM_ENABLED = 
 
     ensemble_cptac_predictions.npz
     fold0_cptac_predictions.npz ... fold4_cptac_predictions.npz
-    model_config_used.json
+    model_config.json
     cptac_gene_level_pcc.csv          (optional, recomputed here anyway)
 
 Download the whole `results/` output folder from each Kaggle run and point FILM_DIR / NOFILM_DIR at them below
+
+Optionally, if you also have fold-level TCGA held-out predictions saved the
+same way (fold0_tcga_predictions.npz ... foldN_tcga_predictions.npz,
+ensemble_tcga_predictions.npz, model_config_used.json), point
+TCGA_FILM_DIR / TCGA_NOFILM_DIR at those directories to include TCGA rows in
+the fold-level subtype gap forest plot below. Leave them as None to skip TCGA
+and get CPTAC-only rows.
 
 WHAT IT PRODUCES (in OUT_DIR):
 Stats (CSV):
@@ -20,11 +27,13 @@ Stats (CSV):
     fold_variance_test.csv          Levene/Bartlett test on 5-fold PCCs
     subtype_fisher_z.csv            LUAD vs LUSC PCC comparison, per model/panel
     subtype_fold_ttest.csv          LUAD vs LUSC PCC, paired t-test across 5 folds, per model/panel
+    fold_subtype_gap.csv            LUSC-LUAD fold-level PCC gap, per model/cohort/panel, with 95% CI
     gene_rank_concordance.csv       Spearman rho between FiLM/no-FiLM gene PCCs
     gene_level_comparison.csv       merged per-gene PCC table (both models)
 
 Figures (PNG, 300dpi):
     fig_forest_fold_pcc.png         per-fold + ensemble PCC, both models, with CI
+    fig_forest_subtype_gap.png      forest plot of fold-level APM/TIS subtype (LUSC-LUAD) gaps, TCGA + CPTAC
     fig_subtype_panel_bars.png      LUAD/LUSC x APM/TIS x model, grouped bars + CI
     fig_gene_scatter.png            per-gene PCC, FiLM vs no-FiLM
 """
@@ -42,8 +51,14 @@ FILM_DIR   = Path("results/FiLM/external-validation")     # FILM_ENABLED = True 
 NOFILM_DIR = Path("results/no-FiLM/external-validation")   # FILM_ENABLED = False run
 
 # Optional: per-patient TCGA predictions saved the same way as the CPTAC ones. "None" skips the formal generalization-gap test
-TCGA_FILM_NPZ   = None   # e.g. Path("tcga_held_out_film") / "ensemble_tcga_predictions.npz"
-TCGA_NOFILM_NPZ = None
+TCGA_FILM_NPZ   = Path("results/FiLM/training")   # e.g. Path("tcga_held_out_film") / "ensemble_tcga_predictions.npz"
+TCGA_NOFILM_NPZ = Path("results/no-FiLM/training")
+
+# Optional: directories of fold-level TCGA held-out predictions, same layout as FILM_DIR/NOFILM_DIR
+# (fold0_tcga_predictions.npz ... foldN_tcga_predictions.npz, ensemble_tcga_predictions.npz,
+# model_config_used.json). "None" skips TCGA rows in the fold-level subtype gap forest plot.
+TCGA_FILM_DIR   = Path("results/FiLM/training")   # e.g. Path("results/FiLM/tcga-held-out")
+TCGA_NOFILM_DIR = Path("results/no-FiLM/training")   # e.g. Path("results/no-FiLM/tcga-held-out")
 
 # TCGA scalar ensemble PCCs, used for the descriptive generalization-gap bar chart
 TCGA_ENSEMBLE_PCC = {
@@ -62,22 +77,29 @@ MODEL_STYLE = {"FiLM": dict(color="#C44E52", marker="o"),
                "No-FiLM": dict(color="#55A868", marker="s")}
 
 # LOADING
-def load_run(run_dir: Path):
-    """Load ensemble + per-fold predictions/labels and gene/panel config for one run."""
+def load_run(run_dir: Path, cohort: str = "cptac"):
+    """
+    Load ensemble + per-fold predictions/labels and gene/panel config for one run.
+
+    `cohort` selects the file naming convention ("cptac" or "tcga"), so this
+    same loader works for the CPTAC external-validation files and for
+    fold-level TCGA held-out files saved with the same layout
+    (foldN_{cohort}_predictions.npz, ensemble_{cohort}_predictions.npz).
+    """
     run_dir = Path(run_dir)
-    cfg = json.load(open(run_dir / "model_config_used.json"))
+    cfg = json.load(open(run_dir / "model_config.json"))
     gene_cols = cfg["gene_cols"]
     apm_genes = cfg["APM_GENES"]
     tis_genes = cfg["TIS_GENES"]
 
-    ens = np.load(run_dir / "ensemble_cptac_predictions.npz", allow_pickle=True)
+    ens = np.load(run_dir / f"ensemble_{cohort}_predictions.npz", allow_pickle=True)
     ensemble_preds = ens["preds"]
     labels = ens["labels"]
     subtypes = ens["subtype"]
     sids = ens["submitter_id"]
 
     fold_preds = {}
-    for f in sorted(run_dir.glob("fold*_cptac_predictions.npz")):
+    for f in sorted(run_dir.glob(f"fold*_{cohort}_predictions.npz")):
         fold_idx = int(f.stem.split("_")[0].replace("fold", ""))
         d = np.load(f, allow_pickle=True)
         fold_preds[fold_idx] = d["preds"]
@@ -235,6 +257,43 @@ def fold_subtype_ttest(run, model_name, panel, genes):
     )
 
 
+# 3c. FOLD-LEVEL SUBTYPE GAP (LUSC - LUAD), summarized across cohorts for the forest plot
+def fold_subtype_gap(run, model_name, cohort_name, panel, genes):
+    """
+    Per-fold LUSC-minus-LUAD panel PCC (same per-fold computation as
+    fold_subtype_ttest), summarized as the mean gap across folds with a
+    t-based 95% CI (df = n_folds - 1). `cohort_name` is just a label
+    ("CPTAC" / "TCGA") carried through into the output row so results from
+    both cohorts can be combined into one forest plot.
+    """
+    subtypes_arr = np.array(run["subtypes"])
+    mask_luad = subtypes_arr == "LUAD"
+    mask_lusc = subtypes_arr == "LUSC"
+
+    fold_gaps = []
+    for _, preds in sorted(run["fold_preds"].items()):
+        r_luad = panel_pcc(preds[mask_luad], run["labels"][mask_luad], run["gene_cols"], genes)
+        r_lusc = panel_pcc(preds[mask_lusc], run["labels"][mask_lusc], run["gene_cols"], genes)
+        fold_gaps.append(r_lusc - r_luad)
+    fold_gaps = np.array(fold_gaps)
+
+    n = len(fold_gaps)
+    mean_gap = float(fold_gaps.mean())
+    if n > 1:
+        sem = float(fold_gaps.std(ddof=1) / np.sqrt(n))
+        tcrit = float(stats.t.ppf(0.975, df=n - 1))
+        ci_lo, ci_hi = mean_gap - tcrit * sem, mean_gap + tcrit * sem
+    else:
+        sem, ci_lo, ci_hi = float("nan"), float("nan"), float("nan")
+
+    return dict(
+        model=model_name, cohort=cohort_name, panel=panel, n_folds=n,
+        fold_gaps=fold_gaps.tolist(),
+        mean_gap_LUSC_minus_LUAD=mean_gap,
+        sem=sem, CI95_low=ci_lo, CI95_high=ci_hi,
+    )
+
+
 # 4. FISHER r-to-z: LUAD vs LUSC PCC, within a given model
 def fisher_r_to_z_test(r1, n1, r2, n2):
     z1 = np.arctanh(r1)
@@ -262,6 +321,125 @@ def subtype_fisher_tests(run, model_name):
                           z=test["z"], p=test["p"]))
     return rows
 
+# 4.b. Direct subtype bootstrap + Permutation test
+def subtype_pcc_bootstrap_permutation(
+    run,
+    panel,
+    genes,
+    n_boot=10000,
+    n_perm=10000,
+    seed=0,
+):
+    rng_local = np.random.default_rng(seed)
+    subtypes = np.asarray(run["subtypes"])
+    labels = np.asarray(run["labels"])
+    preds = np.asarray(run["ensemble_preds"])
+    mask_luad = subtypes == "LUAD"
+    mask_lusc = subtypes == "LUSC"
+
+    # Extract the two independent patient groups
+    pred_luad = preds[mask_luad]
+    lab_luad = labels[mask_luad]
+    pred_lusc = preds[mask_lusc]
+    lab_lusc = labels[mask_lusc]
+    n_luad = len(pred_luad)
+    n_lusc = len(pred_lusc)
+
+    # Observed PCCs
+    r_luad = panel_pcc(
+        pred_luad,
+        lab_luad,
+        run["gene_cols"],
+        genes,
+    )
+    r_lusc = panel_pcc(
+        pred_lusc,
+        lab_lusc,
+        run["gene_cols"],
+        genes,
+    )
+
+    obs_diff = r_lusc - r_luad
+
+    # Bootstrap CI
+    boot_diffs = np.empty(n_boot)
+
+    for i in range(n_boot):
+
+        # Resample patients WITH replacement within each subtype.
+        idx_luad = rng_local.integers(0, n_luad, size=n_luad)
+        idx_lusc = rng_local.integers(0, n_lusc, size=n_lusc)
+
+        r_luad_boot = panel_pcc(
+            pred_luad[idx_luad],
+            lab_luad[idx_luad],
+            run["gene_cols"],
+            genes,
+        )
+        r_lusc_boot = panel_pcc(
+            pred_lusc[idx_lusc],
+            lab_lusc[idx_lusc],
+            run["gene_cols"],
+            genes,
+        )
+
+        boot_diffs[i] = r_lusc_boot - r_luad_boot
+
+    # Percentile bootstrap 95% CI
+    ci_low, ci_high = np.percentile(
+        boot_diffs,
+        [2.5, 97.5],
+    )
+    # Permutation test
+    all_preds = np.concatenate([pred_luad, pred_lusc], axis=0)
+    all_labels = np.concatenate([lab_luad, lab_lusc], axis=0)
+    n_total = n_luad + n_lusc
+    perm_diffs = np.empty(n_perm)
+
+    for i in range(n_perm):
+        perm_idx = rng_local.permutation(n_total)
+        perm_luad_idx = perm_idx[:n_luad]
+        perm_lusc_idx = perm_idx[n_luad:]
+        r_luad_perm = panel_pcc(
+            all_preds[perm_luad_idx],
+            all_labels[perm_luad_idx],
+            run["gene_cols"],
+            genes,
+        )
+        r_lusc_perm = panel_pcc(
+            all_preds[perm_lusc_idx],
+            all_labels[perm_lusc_idx],
+            run["gene_cols"],
+            genes,
+        )
+
+        perm_diffs[i] = r_lusc_perm - r_luad_perm
+
+    p_perm = (
+        np.sum(np.abs(perm_diffs) >= abs(obs_diff)) + 1
+    ) / (n_perm + 1)
+
+    return dict(
+        panel=panel,
+        PCC_LUAD=float(r_luad),
+        n_LUAD=int(n_luad),
+        PCC_LUSC=float(r_lusc),
+        n_LUSC=int(n_lusc),
+
+        # Main effect size
+        diff_LUSC_minus_LUAD=float(obs_diff),
+
+        # Bootstrap uncertainty
+        bootstrap_CI95_low=float(ci_low),
+        bootstrap_CI95_high=float(ci_high),
+
+        # Permutation inference
+        permutation_p=float(p_perm),
+
+        # Useful for diagnostics
+        bootstrap_mean=float(np.mean(boot_diffs)),
+        bootstrap_sd=float(np.std(boot_diffs, ddof=1)),
+    )
 
 # 5. GENE-LEVEL PCC + rank concordance between models
 def gene_level_pccs(run):
@@ -302,6 +480,64 @@ def plot_forest_fold_pcc(film, nofilm, out_path):
         ax.grid(axis="x", alpha=0.3)
 
     fig.suptitle("Per-fold and ensemble PCC — FiLM vs No-FiLM (CPTAC external validation)")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+
+def plot_forest_subtype_gap(gap_df, out_path):
+    """
+    Forest plot of the mean fold-level LUSC-LUAD panel-PCC gap: one row per
+    model x cohort x panel combination, with whiskers at the t-based 95% CI
+    (df = n_folds - 1) and a reference line at zero (no subtype gap).
+    Rows are grouped by cohort (TCGA / CPTAC), with a separator line between
+    cohort blocks; a row is skipped if that combination has < 2 folds (no CI).
+    """
+    df = gap_df.dropna(subset=["CI95_low", "CI95_high"]).copy()
+    if df.empty:
+        return
+
+    cohort_order = sorted(df["cohort"].unique())
+    model_order = ["FiLM", "No-FiLM"]
+    panel_order = ["APM", "TIS"]
+    df["_cohort_rank"] = df["cohort"].apply(cohort_order.index)
+    df["_model_rank"] = df["model"].apply(lambda m: model_order.index(m) if m in model_order else 99)
+    df["_panel_rank"] = df["panel"].apply(lambda p: panel_order.index(p) if p in panel_order else 99)
+    df = df.sort_values(["_cohort_rank", "_model_rank", "_panel_rank"], ascending=False).reset_index(drop=True)
+    df["row_label"] = df["cohort"] + " \u00b7 " + df["model"] + " \u00b7 " + df["panel"]
+
+    y_pos = np.arange(len(df))
+    colors = [MODEL_STYLE.get(m, dict(color="#333333"))["color"] for m in df["model"]]
+    xerr = np.vstack([
+        (df["mean_gap_LUSC_minus_LUAD"] - df["CI95_low"]).values,
+        (df["CI95_high"] - df["mean_gap_LUSC_minus_LUAD"]).values,
+    ])
+
+    fig_h = max(3.0, 0.45 * len(df) + 1.5)
+    fig, ax = plt.subplots(figsize=(8, fig_h))
+    ax.errorbar(df["mean_gap_LUSC_minus_LUAD"], y_pos, xerr=xerr, fmt="none",
+                ecolor="grey", elinewidth=1.2, capsize=3, zorder=2)
+    ax.scatter(df["mean_gap_LUSC_minus_LUAD"], y_pos, c=colors, s=70, zorder=3,
+               edgecolor="k", linewidth=0.4)
+    ax.axvline(0, color="grey", lw=1, ls="--", zorder=1)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(df["row_label"], fontsize=9)
+    ax.set_xlabel("Fold-level PCC gap, LUSC \u2212 LUAD (mean \u00b1 95% CI across folds)")
+    ax.set_title("Subtype gap by fold: APM/TIS panels, FiLM vs No-FiLM")
+    ax.grid(axis="x", alpha=0.3)
+
+    # separator line between cohort blocks
+    for rank in range(1, len(cohort_order)):
+        boundary_cohort = cohort_order[rank]
+        first_idx = df.index[df["cohort"] == boundary_cohort].max()
+        ax.axhline(first_idx + 0.5, color="black", lw=0.8, alpha=0.4)
+
+    handles = [plt.Line2D([0], [0], marker="o", linestyle="", color=MODEL_STYLE[m]["color"],
+                           label=m, markeredgecolor="k", markeredgewidth=0.4)
+               for m in model_order if m in df["model"].unique()]
+    ax.legend(handles=handles, loc="best", fontsize=8)
+
     fig.tight_layout()
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
@@ -462,12 +698,59 @@ ttest_df.to_csv(OUT_DIR / "subtype_fold_ttest.csv", index=False)
 print("\nFold-level paired t-test: LUAD vs LUSC PCC (5 folds per model/panel)")
 print(ttest_df[["model", "panel", "LUAD_mean", "LUSC_mean", "mean_diff", "t_stat", "p"]].to_string(index=False))
 
+# 3c. Fold-level subtype (LUSC-LUAD) gap forest plot — CPTAC, plus TCGA if configured
+gap_rows = []
+for model_name, run in [("FiLM", film), ("No-FiLM", nofilm)]:
+    for panel, genes in [("APM", run["apm_genes"]), ("TIS", run["tis_genes"])]:
+        gap_rows.append(fold_subtype_gap(run, model_name, "CPTAC", panel, genes))
+
+if TCGA_FILM_DIR is not None and TCGA_NOFILM_DIR is not None:
+    tcga_film = load_run(TCGA_FILM_DIR, cohort="tcga")
+    tcga_nofilm = load_run(TCGA_NOFILM_DIR, cohort="tcga")
+    for model_name, run in [("FiLM", tcga_film), ("No-FiLM", tcga_nofilm)]:
+        for panel, genes in [("APM", run["apm_genes"]), ("TIS", run["tis_genes"])]:
+            gap_rows.append(fold_subtype_gap(run, model_name, "TCGA", panel, genes))
+else:
+    print("\n[fold_subtype_gap] TCGA_FILM_DIR / TCGA_NOFILM_DIR not set — "
+          "forest plot will show CPTAC only. Point them at directories of "
+          "fold-level TCGA held-out predictions to add TCGA rows.")
+
+gap_df = pd.DataFrame(gap_rows)
+gap_df.drop(columns=["fold_gaps"]).to_csv(OUT_DIR / "fold_subtype_gap.csv", index=False)
+plot_forest_subtype_gap(gap_df, OUT_DIR / "fig_forest_subtype_gap.png")
+print("\nFold-level subtype gap, LUSC-LUAD (mean +/- 95% CI across folds)")
+print(gap_df.drop(columns=["fold_gaps"]).to_string(index=False))
+
 # 4. Subtype Fisher r-to-z tests, per model
 fisher_rows = subtype_fisher_tests(film, "FiLM") + subtype_fisher_tests(nofilm, "No-FiLM")
 fisher_df = pd.DataFrame(fisher_rows)
 fisher_df.to_csv(OUT_DIR / "subtype_fisher_z.csv", index=False)
 print("LUAD vs LUSC PCC (Fisher r-to-z), per model")
 print(fisher_df.to_string(index=False))
+
+# 4b. Direct subtype bootstrap + permutation test
+subtype_resampling_rows = []
+for panel, genes in [
+    ("APM", film["apm_genes"]),
+    ("TIS", film["tis_genes"]),
+]:
+    res = subtype_pcc_bootstrap_permutation(
+        film,
+        panel,
+        genes,
+        n_boot=10000,
+        n_perm=10000,
+        seed=0,
+    )
+    subtype_resampling_rows.append(res)
+
+subtype_resampling_df = pd.DataFrame(subtype_resampling_rows)
+subtype_resampling_df.to_csv(
+    OUT_DIR / "subtype_pcc_bootstrap_permutation.csv",
+    index=False,
+)
+print("\nDirect subtype PCC bootstrap + permutation test")
+print(subtype_resampling_df.to_string(index=False))
 
 # 5. Gene-level comparison + rank concordance
 gene_df_film = gene_level_pccs(film)

@@ -7,5 +7,5 @@ authors:
   given-names: "Thomas"
 - family-names: "Mazomenos"
   given-names: "Evangelos"
-title: "FiLM-Conditioned Attention-Based MIL Reveals Subtype-Specific Morphological Encoding of Antigen Presentation and T-Cell Inflammation in NSCLC"
+title: "Antigen Presentation Is Subtype-Intrinsic, T-Cell Inflammation Is Not: A Cross-Cohort Dissociation Discovered via Attention-MIL on NSCLC Histology"
 url: "https://github.com/LHu1t/nsclc-immune-film-mil"

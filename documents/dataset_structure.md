@@ -1,5 +1,6 @@
 ## Data Structure
 
+```text
 data/
 │
 ├── tcga-nsclc-metadata.csv
@@ -10,8 +11,18 @@ data/
 │   │
 │   └── LUSC/
 │       ├── TCGA-YY-YYYY.pt
+```
 
 Each feature file contains:
 
-Tensor:
-[N_tiles, feature_dimension] e.g.: TCGA - [7936, 1536]
+**Tensor shape:**
+
+```text
+[N_tiles, feature_dimension]
+```
+
+For example:
+
+```text
+TCGA -> [7936, 1536]
+```
