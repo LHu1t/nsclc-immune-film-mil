@@ -1,0 +1,17 @@
+NOTICE
+
+The MIT License in this repository (see LICENSE) applies to the original
+code in this repository (src/, notebooks/) only. It does not cover, and
+does not grant any rights to, the following third-party assets referenced
+or used by this code:
+
+- TCGA and CPTAC imaging and genomic data (including the metadata derived
+  from them in data/*.csv) remain subject to the NIH Genomic Data Sharing
+  Policy and the GDC's Open Access data-use terms:
+  https://portal.gdc.cancer.gov
+
+- UNI2-h tile-feature embeddings remain subject to the Mahmood Lab's
+  CC-BY-NC-ND 4.0 license. They are not redistributed in this repository;
+  see documents/data_access.md for how to regenerate them independently.
+
+See documents/data_access.md for full provenance and access details.
