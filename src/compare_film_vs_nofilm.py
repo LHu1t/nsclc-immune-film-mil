@@ -74,7 +74,7 @@ rng = np.random.default_rng(SEED)
 
 PANEL_COLORS = {"APM": "#4C72B0", "TIS": "#DD8452"}
 MODEL_STYLE = {"FiLM": dict(color="#C44E52", marker="o"),
-               "No-FiLM": dict(color="#55A868", marker="s")}
+               "No-FiLM": dict(color="#4C72B0", marker="s")}
 
 # LOADING
 def load_run(run_dir: Path, cohort: str = "cptac"):

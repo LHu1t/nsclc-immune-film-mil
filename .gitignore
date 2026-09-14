@@ -23,6 +23,8 @@ figures/tcga/*.csv
 figures/film_comparison_outputs/*.png
 figures/film_comparison_outputs/*.csv
 
+figures/TEST_film_comparison_outputs
+
 # Model weights
 *.pt
 *.pth
