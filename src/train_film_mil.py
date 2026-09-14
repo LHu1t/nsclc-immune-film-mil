@@ -23,14 +23,50 @@ Novel contribution:
     This is the first application of FiLM to subtype-conditioned immune
     gene expression prediction from histopathology.
 
+Aggregator-architecture robustness sweep:
+    The tile-pooling stage below FiLM is pluggable (--aggregator), so the
+    same frozen UNI2-h embeddings, split, and training schedule can be
+    re-run through four different MIL pooling architectures:
+        abmil    - additive Attention-MIL (Ilse et al., 2018)   [default]
+        clam     - CLAM-style gated-attention pooling (Lu et al., 2021)
+        transmil - compact self-attention / Transformer MIL, TransMIL-style
+                   (Shao et al., 2021)
+        graph    - k-NN graph-MIL with residual message passing
+    Use --aggregator_sweep to run all of them in one call and produce a
+    combined summary table (see run_sweep()).
+
 Usage:
+    # Single run with the default (additive Attention-MIL) aggregator:
     python train_film_mil.py \
         --luad_features /path/to/UNI2/Features/TCGA-LUAD \
         --lusc_features /path/to/UNI2/Features/TCGA-LUSC \
         --metadata      /path/to/metadata.csv \
         --output_dir    ./results \
-        --n_folds       5
-        --film_enabled  (true or false)
+        --n_folds       5 \
+        --use_film      false
+
+    # Single run with an alternative aggregator:
+    python train_film_mil.py \
+        --luad_features /path/to/UNI2/Features/TCGA-LUAD \
+        --lusc_features /path/to/UNI2/Features/TCGA-LUSC \
+        --metadata      /path/to/metadata.csv \
+        --output_dir    ./results_transmil \
+        --use_film      false \
+        --aggregator    transmil \
+        --agg_max_tiles 2000
+
+    # Full aggregator-architecture robustness sweep (main technical
+    # contribution): trains/evaluates all four aggregators back-to-back
+    # under identical data/FiLM/training conditions and writes a combined
+    # summary table to <output_dir>/aggregator_sweep_summary.{json,csv}:
+    python train_film_mil.py \
+        --luad_features /path/to/UNI2/Features/TCGA-LUAD \
+        --lusc_features /path/to/UNI2/Features/TCGA-LUSC \
+        --metadata      /path/to/metadata.csv \
+        --output_dir    ./results_aggregator_sweep \
+        --use_film      false \
+        --aggregator_sweep abmil,clam,transmil,graph \
+        --agg_max_tiles 2000
 
 File structure expected in feature directories:
     <luad_features>/<submitter_id>.h5   (keys: features, coords)
@@ -297,6 +333,261 @@ class AttentionMIL(nn.Module):
         return slide_embed, attn.squeeze(-1)            # (512,), (N,)
 
 
+# ---------------------------------------------------------------------------
+# Alternative MIL aggregators (aggregator-architecture robustness sweep)
+#
+# Motivation: the FiLM contribution above sits on top of one specific choice
+# of tile-pooling architecture (additive Attention-MIL). To claim that the
+# subtype-conditioned biological finding is a property of the *modelling
+# idea* rather than an artefact of that one pooling architecture, the same
+# frozen UNI2-h tile embeddings, the same train/val/test split, and the same
+# loss/training schedule are re-used while only the aggregator below the
+# FiLM/clinical/head stack is swapped out. See `build_aggregator()` and
+# `run_sweep()` for the sweep driver.
+# ---------------------------------------------------------------------------
+
+class CLAMGatedAttentionMIL(nn.Module):
+    """
+    CLAM-style single-branch gated-attention pooling (Lu et al., 2021,
+    "Data-efficient and weakly supervised computational pathology on
+    whole-slide images").
+
+    Difference from AttentionMIL above: the attention logit for each tile is
+    computed from a *gated* combination of a tanh branch and a sigmoid gate
+    branch (V(x) * sigmoid(U(x))) instead of a single tanh MLP, which lets
+    the network suppress uninformative tiles more sharply.
+
+    Scope note: this reproduces CLAM's attention-pooling backbone only.
+    Full CLAM additionally trains an auxiliary instance-level clustering
+    loss on the top/bottom-k attended patches per class, which assumes a
+    discrete classification target and has no natural analogue for our
+    continuous 35-gene regression targets, so it is intentionally omitted.
+    This isolates the *aggregation* architecture for a fair comparison
+    against AttentionMIL/TransMIL/graph-MIL — the axis this sweep tests.
+    """
+    def __init__(self, feat_dim: int = 1536, hidden_dim: int = 256,
+                 embed_dim: int = 512, dropout: float = 0.25):
+        super().__init__()
+        self.attention_V = nn.Sequential(nn.Linear(feat_dim, hidden_dim), nn.Tanh())
+        self.attention_U = nn.Sequential(nn.Linear(feat_dim, hidden_dim), nn.Sigmoid())
+        self.attention_w = nn.Linear(hidden_dim, 1)
+        self.feat_proj = nn.Sequential(
+            nn.Linear(feat_dim, embed_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, features):
+        """
+        features : (N_tiles, feat_dim)
+        returns  : slide_embed (embed_dim,), attn_weights (N_tiles,)
+        """
+        assert features.ndim == 2, (
+            f"CLAMGatedAttentionMIL expects (N_tiles, feat_dim), got shape "
+            f"{tuple(features.shape)}"
+        )
+        projected = self.feat_proj(features)                       # (N, embed_dim)
+        gated_logits = self.attention_w(
+            self.attention_V(features) * self.attention_U(features)
+        )                                                            # (N, 1)
+        attn = torch.softmax(gated_logits, dim=0)                   # (N, 1) sums to 1
+        slide_embed = (attn * projected).sum(dim=0)                 # (embed_dim,)
+        return slide_embed, attn.squeeze(-1)
+
+
+class TransMILAggregator(nn.Module):
+    """
+    Compact Transformer MIL aggregator, in the spirit of TransMIL
+    (Shao et al., 2021, "TransMIL: Transformer based Correlated Multiple
+    Instance Learning for Whole Slide Image Classification"): tiles attend
+    to one another via self-attention (correlated MIL) instead of being
+    pooled independently of each other, and a learnable [CLS] token
+    summarises the bag into a single slide embedding.
+
+    Simplifications relative to the original TransMIL, made for tractability
+    on single-GPU (Kaggle T4) training of individual WSI bags that can
+    contain thousands of tiles:
+      1. Standard scaled dot-product self-attention is used in place of the
+         Nystrom approximation, so this module is O(N^2) in tile count.
+         Use --agg_max_tiles to cap N for large bags.
+      2. The Pyramid Position Encoding Generator (PPEG), which requires a
+         registered 2D tile grid, is omitted, since tile spatial coordinates
+         are not consumed elsewhere in this pipeline — tiles are treated as
+         an unordered set, consistent with the other three aggregators in
+         this sweep.
+    """
+    def __init__(self, feat_dim: int = 1536, embed_dim: int = 512,
+                 n_heads: int = 8, n_layers: int = 2,
+                 dim_feedforward: int = 512, dropout: float = 0.25):
+        super().__init__()
+        self.input_proj = nn.Linear(feat_dim, embed_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1, embed_dim))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, features):
+        """
+        features : (N_tiles, feat_dim)
+        returns  : slide_embed (embed_dim,), attn_weights (N_tiles,)
+                   (attn_weights here is a cosine-similarity-to-CLS proxy for
+                   visualisation, since nn.TransformerEncoder does not
+                   expose its internal attention maps by default — it is not
+                   used anywhere in training/loss.)
+        """
+        assert features.ndim == 2, (
+            f"TransMILAggregator expects (N_tiles, feat_dim), got shape "
+            f"{tuple(features.shape)}"
+        )
+        tokens = self.input_proj(features)                          # (N, embed_dim)
+        tokens = torch.cat([self.cls_token, tokens], dim=0).unsqueeze(0)  # (1, N+1, embed_dim)
+        encoded = self.encoder(tokens).squeeze(0)                    # (N+1, embed_dim)
+        slide_embed = self.norm(encoded[0])                          # CLS token -> (embed_dim,)
+        with torch.no_grad():
+            tile_repr = encoded[1:]
+            attn_proxy = F.cosine_similarity(
+                tile_repr, slide_embed.unsqueeze(0).expand_as(tile_repr), dim=-1
+            )
+            attn_proxy = torch.softmax(attn_proxy, dim=0)
+        return slide_embed, attn_proxy
+
+
+class GraphMILAggregator(nn.Module):
+    """
+    Lightweight Graph-MIL aggregator. Tiles are treated as nodes of a
+    feature-space k-nearest-neighbour graph (built by cosine similarity on
+    the projected tile embeddings, since tile spatial coordinates are not
+    consumed elsewhere in this pipeline), messages are passed with a small
+    stack of residual mean-aggregation graph-conv layers, and the resulting
+    node embeddings are pooled to a single slide embedding via an
+    attention-pooling readout (same softmax-attention readout family as
+    AttentionMIL/CLAM above, applied on top of the graph-propagated node
+    features rather than the raw tile features).
+
+    Implemented in plain PyTorch (no torch_geometric dependency) for
+    reliability inside a Kaggle notebook environment. This is intentionally
+    simpler than slide-graph literature such as Patch-GCN, which uses true
+    spatial (not feature-space) adjacency and richer GNN layers; the goal
+    here is to add a genuinely different message-passing inductive bias to
+    the robustness sweep, not to reproduce a specific published model.
+    """
+    def __init__(self, feat_dim: int = 1536, embed_dim: int = 512,
+                 hidden_dim: int = 256, k: int = 8, n_layers: int = 2,
+                 dropout: float = 0.25):
+        super().__init__()
+        self.k = k
+        self.input_proj = nn.Sequential(nn.Linear(feat_dim, hidden_dim), nn.ReLU())
+        self.gnn_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+            for _ in range(n_layers)
+        ])
+        self.out_proj = nn.Linear(hidden_dim, embed_dim)
+        self.attention = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, 1)
+        )
+
+    def _knn_indices(self, x: torch.Tensor):
+        """x : (N, hidden_dim). Returns (N, k) neighbour indices by cosine
+        similarity (self excluded), or None if N <= 1."""
+        n = x.shape[0]
+        if n <= 1:
+            return None
+        with torch.no_grad():
+            x_norm = F.normalize(x, dim=-1)
+            sim = x_norm @ x_norm.t()                 # (N, N)
+            sim.fill_diagonal_(-float("inf"))
+            k = min(self.k, n - 1)
+            _, idx = sim.topk(k, dim=-1)               # (N, k)
+        return idx
+
+    def forward(self, features):
+        """
+        features : (N_tiles, feat_dim)
+        returns  : slide_embed (embed_dim,), attn_weights (N_tiles,)
+        """
+        assert features.ndim == 2, (
+            f"GraphMILAggregator expects (N_tiles, feat_dim), got shape "
+            f"{tuple(features.shape)}"
+        )
+        h = self.input_proj(features)                  # (N, hidden_dim)
+        n = h.shape[0]
+        idx = self._knn_indices(h)
+        for layer in self.gnn_layers:
+            neighbor_mean = h[idx].mean(dim=1) if idx is not None else h  # (N, hidden_dim)
+            h = layer(torch.cat([h, neighbor_mean], dim=-1)) + h          # residual message passing
+        node_embed = self.out_proj(h)                    # (N, embed_dim)
+        attn_logits = self.attention(node_embed)          # (N, 1)
+        attn = torch.softmax(attn_logits, dim=0)
+        slide_embed = (attn * node_embed).sum(dim=0)      # (embed_dim,)
+        return slide_embed, attn.squeeze(-1)
+
+
+AGGREGATOR_CHOICES = ["abmil", "clam", "transmil", "graph"]
+
+
+def build_aggregator(name: str, feat_dim: int, embed_dim: int,
+                      hidden_dim: int = 256, dropout: float = 0.25,
+                      **kwargs) -> nn.Module:
+    """
+    Factory for the aggregator-architecture robustness sweep. Every
+    aggregator below shares the exact same interface:
+        forward(features: (N_tiles, feat_dim)) -> (slide_embed: (embed_dim,),
+                                                     attn_weights: (N_tiles,))
+    so FiLMMILModel (and everything downstream of it — FiLM conditioning,
+    clinical concatenation, the gene/panel heads, the loss, run_epoch) is
+    completely agnostic to which aggregator is plugged in.
+
+    name : one of AGGREGATOR_CHOICES
+        "abmil"    - baseline additive Attention-MIL (Ilse et al., 2018)
+        "clam"     - CLAM-style gated-attention pooling (Lu et al., 2021)
+        "transmil" - compact Transformer / self-attention MIL, TransMIL-style
+                     (Shao et al., 2021)
+        "graph"    - k-NN graph-MIL with residual message passing + attention
+                     readout
+    """
+    name = name.lower()
+    if name == "abmil":
+        return AttentionMIL(feat_dim=feat_dim, hidden_dim=hidden_dim)
+    elif name == "clam":
+        return CLAMGatedAttentionMIL(
+            feat_dim=feat_dim, hidden_dim=hidden_dim, embed_dim=embed_dim, dropout=dropout,
+        )
+    elif name == "transmil":
+        return TransMILAggregator(
+            feat_dim=feat_dim,
+            embed_dim=embed_dim,
+            n_heads=kwargs.get("transmil_heads", 8),
+            n_layers=kwargs.get("transmil_layers", 2),
+            dim_feedforward=kwargs.get("transmil_dim_feedforward", 512),
+            dropout=dropout,
+        )
+    elif name == "graph":
+        return GraphMILAggregator(
+            feat_dim=feat_dim,
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            k=kwargs.get("graph_k", 8),
+            n_layers=kwargs.get("graph_layers", 2),
+            dropout=dropout,
+        )
+    else:
+        raise ValueError(
+            f"Unknown aggregator '{name}'. Choose from: {AGGREGATOR_CHOICES}"
+        )
+
+
 # FiLM conditioning layer
 class FiLMLayer(nn.Module):
     """
@@ -339,11 +630,16 @@ class FiLMLayer(nn.Module):
 # Full model
 class FiLMMILModel(nn.Module):
     """
-    End-to-end FiLM-conditioned Attention-MIL model.
+    End-to-end FiLM-conditioned MIL model.
 
     Pipeline:
         1. Check if FiLM conditioning is enabled
-        2. Attention-MIL: (N_tiles, 1536) -> (512,) slide embedding
+        2. Aggregator:    (N_tiles, 1536) -> (512,) slide embedding. The
+                           pooling architecture is pluggable — see
+                           `aggregator` / `build_aggregator()` — and
+                           defaults to the original additive Attention-MIL
+                           for full backward compatibility with existing
+                           FiLM-vs-no-FiLM checkpoints and results.
         3. FiLM:          condition slide embedding on subtype (LUAD/LUSC)
         4. Clinical:      project [age_z, gender] -> (64,), concatenate
         5. Regression:    (512+64,) -> (n_genes,)
@@ -361,15 +657,39 @@ class FiLMMILModel(nn.Module):
         *,
         use_film:      bool,
         use_panel_head: bool = True,
+        aggregator:    str = "abmil",
+        agg_hidden_dim: int = 256,
+        graph_k:       int = 8,
+        graph_layers:  int = 2,
+        transmil_heads: int = 8,
+        transmil_layers: int = 2,
+        transmil_dim_feedforward: int = 512,
     ):
         super().__init__()
 
         #1. Check if FiLM conditioning is enabled
         self.use_film = use_film
         self.use_panel_head = use_panel_head
+        self.aggregator_name = aggregator
 
-        # 2. Attention-MIL pooling
-        self.attention_mil = AttentionMIL(feat_dim=feat_dim, hidden_dim=256)
+        # 2. MIL aggregator / pooling architecture (aggregator-architecture
+        # robustness sweep — see build_aggregator() docstring for the full
+        # list and the scope/simplification notes for clam/transmil/graph).
+        # Kept under the historical attribute name `attention_mil` so that
+        # aggregator="abmil" (the default) remains checkpoint-compatible
+        # with results produced before this option existed.
+        self.attention_mil = build_aggregator(
+            aggregator,
+            feat_dim=feat_dim,
+            embed_dim=embed_dim,
+            hidden_dim=agg_hidden_dim,
+            dropout=dropout,
+            graph_k=graph_k,
+            graph_layers=graph_layers,
+            transmil_heads=transmil_heads,
+            transmil_layers=transmil_layers,
+            transmil_dim_feedforward=transmil_dim_feedforward,
+        )
 
         # 3. FiLM subtype conditioning
         if self.use_film:
@@ -527,7 +847,11 @@ def compute_panel_head_pcc(all_panel_preds: np.ndarray, all_panel_labels: np.nda
     results = {}
     for i, name in enumerate(PANEL_TARGETS):
         r, _ = pearsonr(all_panel_preds[:, i], all_panel_labels[:, i])
-        results[name] = r if not np.isnan(r) else 0.0
+        # Cast away from numpy float32/float64 (pearsonr preserves input
+        # dtype, and predictions/labels here originate from float32 torch
+        # tensors) so downstream json.dump of fold_results never chokes on
+        # a non-native-float scalar.
+        results[name] = float(r) if not np.isnan(r) else 0.0
     return results
 
 
@@ -689,6 +1013,20 @@ def train(args):
 
     log.info(f"Dev: {len(df_dev)} slides | Test: {len(df_test)} slides")
 
+    # Aggregator configuration for this run (defaults preserve the original
+    # AttentionMIL behaviour when these CLI flags are absent, e.g. when
+    # `args` is a plain argparse.Namespace built before this option existed).
+    aggregator = getattr(args, "aggregator", "abmil")
+    agg_hidden_dim = getattr(args, "agg_hidden_dim", 256)
+    agg_max_tiles = getattr(args, "agg_max_tiles", None)
+    graph_k = getattr(args, "graph_k", 8)
+    graph_layers = getattr(args, "graph_layers", 2)
+    transmil_heads = getattr(args, "transmil_heads", 8)
+    transmil_layers = getattr(args, "transmil_layers", 2)
+    transmil_dim_feedforward = getattr(args, "transmil_dim_feedforward", 512)
+    log.info(f"Aggregator: {aggregator}"
+             + (f" (agg_max_tiles={agg_max_tiles})" if agg_max_tiles else ""))
+
     # 5-fold cross validation
     kf = KFold(n_splits=args.n_folds, shuffle=True, random_state=98)
     fold_results = []
@@ -701,25 +1039,41 @@ def train(args):
         df_train = df_dev.iloc[train_idx].reset_index(drop=True)
         df_val   = df_dev.iloc[val_idx].reset_index(drop=True)
 
-        # Datasets
+        # Datasets. agg_max_tiles caps tiles/slide — strongly recommended
+        # for the transmil/graph aggregators, whose cost scales ~O(N^2) in
+        # tile count, but applied uniformly across aggregators when set so
+        # the comparison stays apples-to-apples on the same input bags.
         train_ds = FiLMDataset(df_train, feature_dirs, gene_cols, clinical_cols,
-                               n_tiles=None, deterministic=False)
+                               n_tiles=agg_max_tiles, deterministic=False)
         val_ds   = FiLMDataset(df_val,   feature_dirs, gene_cols, clinical_cols,
-                               n_tiles=None, deterministic=True)
+                               n_tiles=agg_max_tiles, deterministic=True)
         test_ds  = FiLMDataset(df_test,  feature_dirs, gene_cols, clinical_cols,
-                               n_tiles=None, deterministic=True)
+                               n_tiles=agg_max_tiles, deterministic=True)
 
         train_loader = DataLoader(train_ds, batch_size=1, shuffle=True,  num_workers=4)
         val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, num_workers=4)
         test_loader  = DataLoader(test_ds,  batch_size=1, shuffle=False, num_workers=4)
 
         # Model
-        model    = FiLMMILModel(feat_dim=1536, n_genes=len(gene_cols), use_film=args.use_film).to(device)
+        model    = FiLMMILModel(
+            feat_dim=1536, n_genes=len(gene_cols), use_film=args.use_film,
+            aggregator=aggregator, agg_hidden_dim=agg_hidden_dim,
+            graph_k=graph_k, graph_layers=graph_layers,
+            transmil_heads=transmil_heads, transmil_layers=transmil_layers,
+            transmil_dim_feedforward=transmil_dim_feedforward,
+        ).to(device)
         loss_fn  = CompositeLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, patience=5, factor=0.5, verbose=True
-        )
+        try:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, patience=5, factor=0.5, verbose=True
+            )
+        except TypeError:
+            # `verbose` was removed from ReduceLROnPlateau in newer PyTorch
+            # releases; fall back silently so the sweep still runs.
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, patience=5, factor=0.5
+            )
 
         # Training loop with early stopping
         best_val_pcc  = -np.inf
@@ -790,11 +1144,14 @@ def train(args):
             if mask.sum() == 0:
                 continue
             p, l = test_preds[mask], test_labels[mask]
+            # float(...) here (not just at the top-level fold_result below)
+            # because pearsonr/roc_auc_score preserve the float32 dtype of
+            # our torch-derived arrays, which json.dump cannot serialize.
             res = {
-                "APM_PCC": compute_panel_pcc(p, l, gene_cols, APM_GENES, gene_symbol_to_idx),
-                "TIS_PCC": compute_panel_pcc(p, l, gene_cols, TIS_GENES, gene_symbol_to_idx),
-                "APM_AUC": compute_auc(p, l, gene_cols, APM_GENES, gene_symbol_to_idx),
-                "TIS_AUC": compute_auc(p, l, gene_cols, TIS_GENES, gene_symbol_to_idx),
+                "APM_PCC": float(compute_panel_pcc(p, l, gene_cols, APM_GENES, gene_symbol_to_idx)),
+                "TIS_PCC": float(compute_panel_pcc(p, l, gene_cols, TIS_GENES, gene_symbol_to_idx)),
+                "APM_AUC": float(compute_auc(p, l, gene_cols, APM_GENES, gene_symbol_to_idx)),
+                "TIS_AUC": float(compute_auc(p, l, gene_cols, TIS_GENES, gene_symbol_to_idx)),
                 "n":       int(mask.sum()),
             }
             if test_panel_preds is not None:
@@ -820,6 +1177,7 @@ def train(args):
             },
             "subtype":        subtype_results,
             "use_film": args.use_film,
+            "aggregator": aggregator,
         }
         fold_results.append(fold_result)
 
@@ -858,6 +1216,100 @@ def train(args):
         json.dump(fold_results, f, indent=2)
     log.info(f"\nResults saved to {output_dir / 'results.json'}")
 
+    return fold_results
+
+
+# ---------------------------------------------------------------------------
+# Aggregator-architecture robustness sweep driver
+# ---------------------------------------------------------------------------
+def run_sweep(args):
+    """
+    Runs the full n_folds x train/val/test pipeline once per aggregator in
+    `args.aggregator_sweep` (comma-separated, e.g. "abmil,clam,transmil,graph"),
+    holding everything else fixed — data split, FiLM setting, loss, training
+    schedule, epochs/patience — so the only variable across runs is the
+    pooling/aggregation architecture applied to the same frozen UNI2-h tile
+    embeddings. Each aggregator's full results (per-fold, per-gene, per-
+    subtype) are written to `<output_dir>/<aggregator>/results.json` exactly
+    as `train()` normally would, and a combined summary table is written to
+    `<output_dir>/aggregator_sweep_summary.{json,csv}` for direct use as a
+    robustness table/figure in the paper.
+    """
+    import copy
+    import csv
+
+    aggregators = [a.strip() for a in args.aggregator_sweep.split(",") if a.strip()]
+    unknown = [a for a in aggregators if a not in AGGREGATOR_CHOICES]
+    if unknown:
+        raise ValueError(
+            f"Unknown aggregator(s) in --aggregator_sweep: {unknown}. "
+            f"Choose from: {AGGREGATOR_CHOICES}"
+        )
+
+    base_output_dir = Path(args.output_dir)
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics = ["APM_PCC", "TIS_PCC", "APM_AUC", "TIS_AUC", "APM_head_PCC", "TIS_head_PCC"]
+    sweep_summary = []
+    all_fold_results = {}
+
+    for agg in aggregators:
+        log.info(f"\n{'#'*70}")
+        log.info(f"# AGGREGATOR SWEEP: {agg}")
+        log.info(f"{'#'*70}")
+
+        run_args = copy.deepcopy(args)
+        run_args.aggregator = agg
+        run_args.output_dir = str(base_output_dir / agg)
+
+        fold_results = train(run_args)
+        all_fold_results[agg] = fold_results
+
+        row = {"aggregator": agg, "n_folds": len(fold_results)}
+        for metric in metrics:
+            vals = [r[metric] for r in fold_results if r.get(metric) is not None]
+            if vals:
+                row[f"{metric}_mean"] = float(np.mean(vals))
+                row[f"{metric}_std"] = float(np.std(vals))
+        n_params = sum(
+            p.numel() for p in
+            FiLMMILModel(
+                feat_dim=1536, n_genes=1, use_film=args.use_film, aggregator=agg,
+                agg_hidden_dim=getattr(args, "agg_hidden_dim", 256),
+                graph_k=getattr(args, "graph_k", 8),
+                graph_layers=getattr(args, "graph_layers", 2),
+                transmil_heads=getattr(args, "transmil_heads", 8),
+                transmil_layers=getattr(args, "transmil_layers", 2),
+                transmil_dim_feedforward=getattr(args, "transmil_dim_feedforward", 512),
+            ).parameters()
+        )
+        row["n_params"] = n_params
+        sweep_summary.append(row)
+
+    with open(base_output_dir / "aggregator_sweep_summary.json", "w") as f:
+        json.dump(sweep_summary, f, indent=2)
+
+    if sweep_summary:
+        fieldnames = list(sweep_summary[0].keys())
+        with open(base_output_dir / "aggregator_sweep_summary.csv", "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(sweep_summary)
+
+    log.info(f"\n{'='*70}")
+    log.info("AGGREGATOR ROBUSTNESS SWEEP SUMMARY")
+    log.info(f"{'='*70}")
+    for row in sweep_summary:
+        log.info(
+            f"  {row['aggregator']:>10s} | "
+            f"APM_PCC={row.get('APM_PCC_mean', float('nan')):.4f}±{row.get('APM_PCC_std', 0.0):.4f} | "
+            f"TIS_PCC={row.get('TIS_PCC_mean', float('nan')):.4f}±{row.get('TIS_PCC_std', 0.0):.4f} | "
+            f"params={row.get('n_params', 'NA')}"
+        )
+    log.info(f"\nSummary saved to {base_output_dir / 'aggregator_sweep_summary.json'} and .csv")
+
+    return sweep_summary, all_fold_results
+
 
 # CLI
 def parse_args():
@@ -876,9 +1328,42 @@ def parse_args():
                    help="Early stopping patience (epochs without val PCC improvement)")
     p.add_argument("--use_film",
                    help="Enable FiLM subtype conditioning.")
+
+    # Aggregator-architecture robustness sweep
+    p.add_argument("--aggregator", choices=AGGREGATOR_CHOICES, default="abmil",
+                   help="MIL pooling/aggregation architecture applied to the frozen "
+                        "UNI2-h tile embeddings, below FiLM/clinical/heads. "
+                        f"Choices: {AGGREGATOR_CHOICES}.")
+    p.add_argument("--aggregator_sweep", default=None,
+                   help="Comma-separated list of aggregators (e.g. "
+                        "'abmil,clam,transmil,graph') to run the full training "
+                        "pipeline over, with FiLM/data/loss held fixed, producing "
+                        "a combined robustness summary. Overrides --aggregator "
+                        "and switches the script into sweep mode when set.")
+    p.add_argument("--agg_hidden_dim", type=int, default=256,
+                   help="Hidden width used inside the chosen aggregator "
+                        "(attention MLP / gated-attention MLP / graph-conv width).")
+    p.add_argument("--agg_max_tiles", type=int, default=None,
+                   help="Optional cap on tiles sampled per slide before pooling. "
+                        "Strongly recommended for --aggregator transmil/graph on "
+                        "large bags, since both scale roughly O(N^2) in tile count.")
+    p.add_argument("--graph_k", type=int, default=8,
+                   help="[graph aggregator] number of nearest neighbours per tile node.")
+    p.add_argument("--graph_layers", type=int, default=2,
+                   help="[graph aggregator] number of residual graph-conv layers.")
+    p.add_argument("--transmil_heads", type=int, default=8,
+                   help="[transmil aggregator] number of self-attention heads.")
+    p.add_argument("--transmil_layers", type=int, default=2,
+                   help="[transmil aggregator] number of Transformer encoder layers.")
+    p.add_argument("--transmil_dim_feedforward", type=int, default=512,
+                   help="[transmil aggregator] Transformer feed-forward width.")
+
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    train(args)
+    if args.aggregator_sweep:
+        run_sweep(args)
+    else:
+        train(args)
