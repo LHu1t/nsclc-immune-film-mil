@@ -32,7 +32,10 @@ Aggregator-architecture robustness sweep:
         transmil - compact self-attention / Transformer MIL, TransMIL-style
                    (Shao et al., 2021)
         graph    - k-NN graph-MIL with residual message passing
-    Use --aggregator_sweep to run all of them in one call and produce a
+    This tests whether the FiLM / subtype-conditioning finding survives a
+    change of aggregator, i.e. that it is a property of the modelling idea
+    and not an artefact of one specific pooling architecture. Use
+    --aggregator_sweep to run all of them in one call and produce a
     combined summary table (see run_sweep()).
 
 Usage:
@@ -43,7 +46,7 @@ Usage:
         --metadata      /path/to/metadata.csv \
         --output_dir    ./results \
         --n_folds       5 \
-        --use_film      false
+        --use_film      true
 
     # Single run with an alternative aggregator:
     python train_film_mil.py \
@@ -51,7 +54,7 @@ Usage:
         --lusc_features /path/to/UNI2/Features/TCGA-LUSC \
         --metadata      /path/to/metadata.csv \
         --output_dir    ./results_transmil \
-        --use_film      false \
+        --use_film      true \
         --aggregator    transmil \
         --agg_max_tiles 2000
 
@@ -64,7 +67,7 @@ Usage:
         --lusc_features /path/to/UNI2/Features/TCGA-LUSC \
         --metadata      /path/to/metadata.csv \
         --output_dir    ./results_aggregator_sweep \
-        --use_film      false \
+        --use_film      true \
         --aggregator_sweep abmil,clam,transmil,graph \
         --agg_max_tiles 2000
 
@@ -76,6 +79,8 @@ File structure expected in feature directories:
 import argparse
 import json
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import h5py
@@ -172,6 +177,73 @@ def load_metadata(gene_csv: str):
     return df, gene_cols, clinical_cols, y_means, y_stds, panel_idx
 
 
+# ---------------------------------------------------------------------------
+# Process-wide feature cache
+#
+# FiLMDataset.__getitem__ previously opened and fully decompressed the
+# relevant .h5 file from disk on every single access -- every epoch, every
+# fold, and (in the aggregator sweep) every aggregator. That repeated disk
+# IO + h5py decompression is CPU-bound work spread across the DataLoader
+# workers, and it is almost always the real bottleneck behind the symptom
+# pattern "CPU pinned near 100% across all cores, GPU utilization low,
+# RAM/VRAM nowhere near their limits, and reducing n_tiles doesn't help" --
+# because the FULL tile array was always read from disk before any
+# tile-subsampling happened, so a tile cap only reduces GPU compute (already
+# cheap for these aggregators), not the IO that was actually gating
+# throughput.
+#
+# The fix: cache every unique .h5 file's feature array in memory, once, for
+# the life of the Python process. Every later __getitem__ call becomes a
+# pure in-memory NumPy slice with no disk IO or decompression at all.
+# ---------------------------------------------------------------------------
+_FEATURE_CACHE: dict[str, np.ndarray] = {}
+
+
+def _load_features_cached(h5_path) -> np.ndarray:
+    key = str(h5_path)
+    cached = _FEATURE_CACHE.get(key)
+    if cached is None:
+        with h5py.File(h5_path, "r") as f:
+            cached = f["features"][:].astype(np.float32, copy=False)
+        _FEATURE_CACHE[key] = cached
+    return cached
+
+
+def preload_feature_cache(feature_dirs: dict, max_workers: int = 8) -> None:
+    """
+    Eagerly loads every .h5 feature file found in `feature_dirs` into
+    `_FEATURE_CACHE`, once, BEFORE any DataLoader workers are spawned.
+
+    Call this exactly once, right after `feature_dirs` is known and before
+    any DataLoader is constructed (train() and the notebook sweep loop both
+    do this). Effects:
+      - every unique .h5 file is read from disk exactly once for the life
+        of the process, no matter how many folds/aggregators subsequently
+        run against it;
+      - DataLoader workers spawned afterwards inherit the already-populated
+        cache via copy-on-write fork on Linux, so the cache is NOT
+        duplicated per worker;
+      - safe to call again later (e.g. once per aggregator in a sweep):
+        already-cached files are skipped, so repeat calls are near-instant.
+
+    Uses a thread pool because the reads are IO-bound (h5py releases the
+    GIL during the actual disk read), so this preload step itself is
+    already several times faster than a naive sequential loop.
+    """
+    paths = [p for fdir in feature_dirs.values() for p in Path(fdir).glob("*.h5")]
+    to_load = [p for p in paths if str(p) not in _FEATURE_CACHE]
+    if not to_load:
+        return
+    log.info(f"Preloading {len(to_load)} feature file(s) into RAM "
+             f"({len(paths) - len(to_load)} already cached)...")
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        list(ex.map(_load_features_cached, to_load))
+    total_mb = sum(a.nbytes for a in _FEATURE_CACHE.values()) / 1e6
+    log.info(f"Preload done in {time.time() - t0:.1f}s "
+             f"({total_mb:.0f} MB resident in the feature cache)")
+
+
 # Dataset
 class FiLMDataset(Dataset):
     """
@@ -266,28 +338,29 @@ class FiLMDataset(Dataset):
     def __getitem__(self, idx):
         rec = self.records[idx]
 
-        with h5py.File(rec["h5_path"], "r") as f:
-            features = torch.tensor(f["features"][:], dtype=torch.float32)  # expected (N, 1536)
+        # In-memory cache lookup (see preload_feature_cache) instead of a
+        # fresh h5py.File(...).read() + decompress on every access.
+        features_np = _load_features_cached(rec["h5_path"])
 
-        if features.ndim == 3 and features.shape[0] == 1:
-            features = features.squeeze(0)
-        elif features.ndim != 2:
+        if features_np.ndim == 3 and features_np.shape[0] == 1:
+            features_np = features_np[0]
+        elif features_np.ndim != 2:
             raise ValueError(
-                f"Unexpected features shape {tuple(features.shape)} in "
+                f"Unexpected features shape {features_np.shape} in "
                 f"{rec['h5_path']} - expected (N_tiles, feat_dim)."
             )
 
         # Tile sampling
-        n = features.shape[0]
+        n = features_np.shape[0]
         if self.n_tiles is not None and self.n_tiles < n:
             if self.deterministic:
                 rng    = np.random.default_rng(self.seed + idx)
-                chosen = torch.tensor(
-                    sorted(rng.choice(n, size=self.n_tiles, replace=False))
-                )
+                chosen = sorted(rng.choice(n, size=self.n_tiles, replace=False))
             else:
-                chosen = torch.randperm(n)[: self.n_tiles]
-            features = features[chosen]
+                chosen = np.random.permutation(n)[: self.n_tiles]
+            features = torch.from_numpy(features_np[chosen].copy())
+        else:
+            features = torch.from_numpy(features_np.copy())
 
         label      = torch.tensor(rec["label"],     dtype=torch.float32)
         label_raw  = torch.tensor(rec["label_raw"], dtype=torch.float32)
@@ -922,10 +995,10 @@ def run_epoch(
             features, label, _, clinical, subtype_id, _ = batch
 
             # All inputs: single slide (batch_size=1), squeeze batch dim
-            features   = features.squeeze(0).to(device)    # (N_tiles, 1536)
-            label      = label.squeeze(0).to(device)       # (35,)
-            clinical   = clinical.squeeze(0).to(device)    # (2,)
-            subtype_id = subtype_id.squeeze(0).to(device)  # scalar
+            features   = features.squeeze(0).to(device, non_blocking=True)    # (N_tiles, 1536)
+            label      = label.squeeze(0).to(device, non_blocking=True)       # (35,)
+            clinical   = clinical.squeeze(0).to(device, non_blocking=True)    # (2,)
+            subtype_id = subtype_id.squeeze(0).to(device, non_blocking=True)  # scalar
 
             pred, _, panel_pred = model(features, clinical, subtype_id)  # (35,), (2,) or None
 
@@ -1002,6 +1075,13 @@ def train(args):
         "LUSC": args.lusc_features,
     }
 
+    # Preload every .h5 feature file into RAM once, before any DataLoader
+    # workers are spawned (see preload_feature_cache() docstring). This is
+    # the single biggest throughput fix when CPU is pegged near 100% while
+    # GPU utilization stays low: it removes repeated disk IO + h5py
+    # decompression from every fold's every epoch.
+    preload_feature_cache(feature_dirs)
+
     # Fixed test set (20%)
     rng = np.random.default_rng(98)
     all_sids = df["submitter_id"].unique()
@@ -1050,9 +1130,12 @@ def train(args):
         test_ds  = FiLMDataset(df_test,  feature_dirs, gene_cols, clinical_cols,
                                n_tiles=agg_max_tiles, deterministic=True)
 
-        train_loader = DataLoader(train_ds, batch_size=1, shuffle=True,  num_workers=4)
-        val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, num_workers=4)
-        test_loader  = DataLoader(test_ds,  batch_size=1, shuffle=False, num_workers=4)
+        train_loader = DataLoader(train_ds, batch_size=1, shuffle=True,  num_workers=4,
+                                  pin_memory=True, persistent_workers=True, prefetch_factor=4)
+        val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, num_workers=2,
+                                  pin_memory=True, persistent_workers=True, prefetch_factor=4)
+        test_loader  = DataLoader(test_ds,  batch_size=1, shuffle=False, num_workers=2,
+                                  pin_memory=True, persistent_workers=True, prefetch_factor=4)
 
         # Model
         model    = FiLMMILModel(
