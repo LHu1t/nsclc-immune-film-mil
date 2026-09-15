@@ -79,6 +79,7 @@ File structure expected in feature directories:
 import argparse
 import json
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -192,56 +193,154 @@ def load_metadata(gene_csv: str):
 # cheap for these aggregators), not the IO that was actually gating
 # throughput.
 #
-# The fix: cache every unique .h5 file's feature array in memory, once, for
-# the life of the Python process. Every later __getitem__ call becomes a
-# pure in-memory NumPy slice with no disk IO or decompression at all.
+# The fix: cache unique .h5 feature arrays in memory for the life of the
+# process. When the dataset is small enough to fit in RAM outright, every
+# file gets cached and every __getitem__ becomes a pure in-memory slice.
+# When it doesn't (e.g. a 30GB-RAM Kaggle session against a 70GB combined
+# LUAD+LUSC corpus), the cache is BUDGET-CAPPED via configure_feature_cache():
+# it fills up to a byte ceiling and then stops caching new files -- it does
+# NOT evict already-cached entries to make room for new ones, since with
+# random per-epoch shuffling there's no useful temporal locality to exploit
+# and LRU-style eviction would just thrash (constantly evicting and
+# re-loading) without ever converging to a stable hit rate. Whatever doesn't
+# fit in the budget is read from disk on every access, exactly as before
+# caching existed -- no worse than the original behaviour, and the portion
+# that DOES fit is a pure win. Optionally storing the cache in float16
+# (roughly halving its footprint; values are upcast back to float32 per
+# accessed tile, so training precision is unaffected) lets substantially
+# more of a large corpus fit under a fixed RAM budget.
 # ---------------------------------------------------------------------------
 _FEATURE_CACHE: dict[str, np.ndarray] = {}
+_FEATURE_CACHE_BYTES = 0
+_FEATURE_CACHE_MAX_BYTES: int | None = None   # None = uncapped (original behaviour)
+_FEATURE_CACHE_DTYPE = np.float32
+_feature_cache_lock = threading.Lock()
+
+
+def configure_feature_cache(max_gb: float | None = None, dtype: str = "float32") -> None:
+    """
+    Sets the memory budget and storage dtype for the process-wide feature
+    cache. Call this ONCE, before preload_feature_cache() / before any
+    DataLoader is constructed, whenever the full dataset does not comfortably
+    fit in RAM alongside everything else (OS, PyTorch, pandas, DataLoader
+    worker processes, pinned-memory buffers, ...).
+
+    max_gb : cap on cache size in GiB. None (default) means uncapped -- only
+        safe if the whole corpus comfortably fits in RAM on its own. Leave
+        meaningful headroom below your box's total RAM: e.g. on a 30GB
+        Kaggle session, something like max_gb=18-20 is a reasonable starting
+        point, not max_gb=30.
+    dtype : "float32" (default, no precision loss) or "float16" (roughly
+        halves the cache footprint). Cached arrays are upcast to float32
+        per accessed/subsampled tile before being handed to the model, so
+        this only affects the resting in-memory copy, not the precision
+        anything is trained/evaluated with.
+
+    Example, for a ~70GB combined LUAD+LUSC corpus on a 30GB-RAM session:
+        configure_feature_cache(max_gb=20, dtype="float16")
+    caches up to 20GB of *float16* features (~40GB worth of original
+    float32 data -- i.e. potentially the whole corpus), leaving ~10GB
+    headroom for everything else.
+    """
+    global _FEATURE_CACHE_MAX_BYTES, _FEATURE_CACHE_DTYPE
+    if dtype not in ("float32", "float16"):
+        raise ValueError(f"dtype must be 'float32' or 'float16', got {dtype!r}")
+    _FEATURE_CACHE_MAX_BYTES = None if max_gb is None else int(max_gb * (1024 ** 3))
+    _FEATURE_CACHE_DTYPE = {"float32": np.float32, "float16": np.float16}[dtype]
+    log.info(
+        "Feature cache configured: budget="
+        + ("unlimited" if max_gb is None else f"{max_gb:.1f} GB")
+        + f", dtype={dtype}"
+    )
 
 
 def _load_features_cached(h5_path) -> np.ndarray:
+    """
+    Returns the (N_tiles, feat_dim) feature array for `h5_path`, from cache
+    if present. If not cached and there's room left in the configured
+    budget, reads it from disk, casts to the configured cache dtype, stores
+    it, and returns it. If the budget is already full, reads it from disk
+    and returns it WITHOUT caching it (no eviction of existing entries).
+    """
+    global _FEATURE_CACHE_BYTES
     key = str(h5_path)
     cached = _FEATURE_CACHE.get(key)
-    if cached is None:
-        with h5py.File(h5_path, "r") as f:
-            cached = f["features"][:].astype(np.float32, copy=False)
-        _FEATURE_CACHE[key] = cached
-    return cached
+    if cached is not None:
+        return cached
+
+    with h5py.File(h5_path, "r") as f:
+        arr = f["features"][:].astype(_FEATURE_CACHE_DTYPE, copy=False)
+
+    with _feature_cache_lock:
+        if key not in _FEATURE_CACHE and (
+            _FEATURE_CACHE_MAX_BYTES is None
+            or _FEATURE_CACHE_BYTES + arr.nbytes <= _FEATURE_CACHE_MAX_BYTES
+        ):
+            _FEATURE_CACHE[key] = arr
+            _FEATURE_CACHE_BYTES += arr.nbytes
+    return arr
 
 
-def preload_feature_cache(feature_dirs: dict, max_workers: int = 8) -> None:
+def preload_feature_cache(feature_dirs: dict, max_workers: int = 8,
+                           priority_paths: list | None = None) -> None:
     """
-    Eagerly loads every .h5 feature file found in `feature_dirs` into
-    `_FEATURE_CACHE`, once, BEFORE any DataLoader workers are spawned.
+    Eagerly loads .h5 feature files found in `feature_dirs` into
+    `_FEATURE_CACHE`, once, BEFORE any DataLoader workers are spawned, up to
+    whatever budget was set via configure_feature_cache() (uncapped by
+    default).
 
-    Call this exactly once, right after `feature_dirs` is known and before
-    any DataLoader is constructed (train() and the notebook sweep loop both
-    do this). Effects:
-      - every unique .h5 file is read from disk exactly once for the life
-        of the process, no matter how many folds/aggregators subsequently
-        run against it;
-      - DataLoader workers spawned afterwards inherit the already-populated
-        cache via copy-on-write fork on Linux, so the cache is NOT
-        duplicated per worker;
-      - safe to call again later (e.g. once per aggregator in a sweep):
-        already-cached files are skipped, so repeat calls are near-instant.
+    priority_paths : optional list of h5 paths to attempt to cache FIRST,
+        before the rest of the corpus. Pass the fixed test set's h5 paths
+        here when the cache is budget-capped: the test set is re-read
+        identically by every fold and (in the aggregator sweep) every
+        aggregator, so it has the highest reuse value per cached byte and
+        should be the first thing to survive a tight budget.
 
-    Uses a thread pool because the reads are IO-bound (h5py releases the
-    GIL during the actual disk read), so this preload step itself is
-    already several times faster than a naive sequential loop.
+    Call this exactly once per script run (train() and the notebook sweep
+    loop both do this); safe to call again later (e.g. once per aggregator
+    in a sweep) since already-cached files are skipped instantly, and once
+    the budget is full, remaining files are skipped without even being
+    re-read.
     """
-    paths = [p for fdir in feature_dirs.values() for p in Path(fdir).glob("*.h5")]
-    to_load = [p for p in paths if str(p) not in _FEATURE_CACHE]
-    if not to_load:
+    all_paths = [p for fdir in feature_dirs.values() for p in Path(fdir).glob("*.h5")]
+    if priority_paths:
+        priority_set = {str(p) for p in priority_paths}
+        ordered = ([p for p in all_paths if str(p) in priority_set]
+                   + [p for p in all_paths if str(p) not in priority_set])
+    else:
+        ordered = all_paths
+
+    to_consider = [p for p in ordered if str(p) not in _FEATURE_CACHE]
+    if not to_consider:
         return
-    log.info(f"Preloading {len(to_load)} feature file(s) into RAM "
-             f"({len(paths) - len(to_load)} already cached)...")
+
+    budget_desc = ("unlimited" if _FEATURE_CACHE_MAX_BYTES is None
+                   else f"{_FEATURE_CACHE_MAX_BYTES / 1e9:.1f} GB")
+    log.info(f"Preloading feature cache (budget: {budget_desc}, "
+             f"dtype: {_FEATURE_CACHE_DTYPE.__name__}, "
+             f"{len(to_consider)} file(s) to consider)...")
     t0 = time.time()
+
+    def _try_load(p):
+        # Skip the disk read entirely once the budget is already full --
+        # no point paying IO for an array we know we won't retain.
+        if (_FEATURE_CACHE_MAX_BYTES is not None
+                and _FEATURE_CACHE_BYTES >= _FEATURE_CACHE_MAX_BYTES):
+            return
+        _load_features_cached(p)
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        list(ex.map(_load_features_cached, to_load))
-    total_mb = sum(a.nbytes for a in _FEATURE_CACHE.values()) / 1e6
-    log.info(f"Preload done in {time.time() - t0:.1f}s "
-             f"({total_mb:.0f} MB resident in the feature cache)")
+        list(ex.map(_try_load, to_consider))
+
+    n_cached = sum(1 for p in to_consider if str(p) in _FEATURE_CACHE)
+    n_skipped = len(to_consider) - n_cached
+    log.info(
+        f"Preload done in {time.time() - t0:.1f}s: {n_cached}/{len(to_consider)} "
+        f"file(s) cached ({_FEATURE_CACHE_BYTES / 1e9:.2f} GB resident)."
+        + (f" {n_skipped} file(s) did not fit the budget and will be read "
+           f"from disk on each access (same cost as before caching)."
+           if n_skipped else "")
+    )
 
 
 # Dataset
@@ -350,7 +449,11 @@ class FiLMDataset(Dataset):
                 f"{rec['h5_path']} - expected (N_tiles, feat_dim)."
             )
 
-        # Tile sampling
+        # Tile sampling. Cast to float32 here regardless of the cache's
+        # storage dtype (float16 when configure_feature_cache(dtype=...) is
+        # used to fit a larger corpus in a limited RAM budget) -- casting
+        # AFTER subsampling, not before, means we only upcast the tiles we
+        # actually keep.
         n = features_np.shape[0]
         if self.n_tiles is not None and self.n_tiles < n:
             if self.deterministic:
@@ -358,9 +461,10 @@ class FiLMDataset(Dataset):
                 chosen = sorted(rng.choice(n, size=self.n_tiles, replace=False))
             else:
                 chosen = np.random.permutation(n)[: self.n_tiles]
-            features = torch.from_numpy(features_np[chosen].copy())
+            sub = features_np[chosen]
         else:
-            features = torch.from_numpy(features_np.copy())
+            sub = features_np
+        features = torch.from_numpy(sub.astype(np.float32, copy=True))
 
         label      = torch.tensor(rec["label"],     dtype=torch.float32)
         label_raw  = torch.tensor(rec["label_raw"], dtype=torch.float32)
@@ -1075,13 +1179,6 @@ def train(args):
         "LUSC": args.lusc_features,
     }
 
-    # Preload every .h5 feature file into RAM once, before any DataLoader
-    # workers are spawned (see preload_feature_cache() docstring). This is
-    # the single biggest throughput fix when CPU is pegged near 100% while
-    # GPU utilization stays low: it removes repeated disk IO + h5py
-    # decompression from every fold's every epoch.
-    preload_feature_cache(feature_dirs)
-
     # Fixed test set (20%)
     rng = np.random.default_rng(98)
     all_sids = df["submitter_id"].unique()
@@ -1092,6 +1189,26 @@ def train(args):
     df_dev  = df[df["submitter_id"].isin(dev_sids)].reset_index(drop=True)
 
     log.info(f"Dev: {len(df_dev)} slides | Test: {len(df_test)} slides")
+
+    # Configure + preload the feature cache. If --feature_cache_max_gb is
+    # unset, this preserves the original uncapped behaviour (only safe if
+    # the corpus comfortably fits in RAM). If set (e.g. on a 30GB-RAM
+    # session against a much larger combined LUAD+LUSC corpus), the cache
+    # fills up to that budget and stops -- no eviction/thrashing, whatever
+    # doesn't fit is just read from disk as before. The fixed test set is
+    # prioritised first since it's re-read identically by every fold and
+    # (in the aggregator sweep) every aggregator.
+    configure_feature_cache(
+        max_gb=getattr(args, "feature_cache_max_gb", None),
+        dtype=getattr(args, "feature_cache_dtype", "float32"),
+    )
+    _test_paths_for_priority = FiLMDataset(
+        df_test, feature_dirs, gene_cols, clinical_cols
+    ).records
+    preload_feature_cache(
+        feature_dirs,
+        priority_paths=[r["h5_path"] for r in _test_paths_for_priority],
+    )
 
     # Aggregator configuration for this run (defaults preserve the original
     # AttentionMIL behaviour when these CLI flags are absent, e.g. when
@@ -1440,6 +1557,21 @@ def parse_args():
                    help="[transmil aggregator] number of Transformer encoder layers.")
     p.add_argument("--transmil_dim_feedforward", type=int, default=512,
                    help="[transmil aggregator] Transformer feed-forward width.")
+
+    # Feature cache (RAM-budget control for large corpora)
+    p.add_argument("--feature_cache_max_gb", type=float, default=None,
+                   help="Cap the in-memory feature cache at this many GiB. Leave "
+                        "unset for the original uncapped behaviour (only safe if "
+                        "the whole corpus comfortably fits in RAM). Once full, "
+                        "additional files are read from disk on each access "
+                        "instead of being cached (no eviction/thrashing). "
+                        "The fixed test set is always prioritised into whatever "
+                        "budget is available.")
+    p.add_argument("--feature_cache_dtype", choices=["float32", "float16"], default="float32",
+                   help="Storage dtype for the feature cache. float16 roughly "
+                        "halves the cache footprint; values are upcast to "
+                        "float32 per accessed tile before reaching the model, "
+                        "so this only affects the resting in-memory copy.")
 
     return p.parse_args()
 
