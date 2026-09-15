@@ -281,6 +281,39 @@ def _load_features_cached(h5_path) -> np.ndarray:
     return arr
 
 
+def preload_paths(paths: list, max_workers: int = 8) -> None:
+    """
+    Like preload_feature_cache(), but takes an explicit list of .h5 paths
+    instead of scanning whole feature directories. Use this to warm the
+    cache for a specific, deliberately-small-and-safe-to-cache subset --
+    e.g. the fixed test set -- without also inadvertently pulling
+    train/val files toward the budget cap, which would then be wasted
+    (train/val bypass the cache entirely when use_feature_cache=False).
+    """
+    to_consider = [p for p in paths if str(p) not in _FEATURE_CACHE]
+    if not to_consider:
+        return
+    budget_desc = ("unlimited" if _FEATURE_CACHE_MAX_BYTES is None
+                   else f"{_FEATURE_CACHE_MAX_BYTES / 1e9:.1f} GB")
+    log.info(f"Preloading feature cache (budget: {budget_desc}, "
+             f"dtype: {_FEATURE_CACHE_DTYPE.__name__}, "
+             f"{len(to_consider)} file(s) to consider)...")
+    t0 = time.time()
+
+    def _try_load(p):
+        if (_FEATURE_CACHE_MAX_BYTES is not None
+                and _FEATURE_CACHE_BYTES >= _FEATURE_CACHE_MAX_BYTES):
+            return
+        _load_features_cached(p)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        list(ex.map(_try_load, to_consider))
+
+    n_cached = sum(1 for p in to_consider if str(p) in _FEATURE_CACHE)
+    log.info(f"Preload done in {time.time() - t0:.1f}s: {n_cached}/{len(to_consider)} "
+             f"file(s) cached ({_FEATURE_CACHE_BYTES / 1e9:.2f} GB resident).")
+
+
 def preload_feature_cache(feature_dirs: dict, max_workers: int = 8,
                            priority_paths: list | None = None) -> None:
     """
@@ -362,6 +395,7 @@ class FiLMDataset(Dataset):
         n_tiles: int | None = None, # None = all tiles
         deterministic: bool = False,
         seed: int = 98,
+        use_feature_cache: bool = True,
     ):
         self.gene_cols     = gene_cols
         self.clinical_cols = clinical_cols
@@ -369,6 +403,21 @@ class FiLMDataset(Dataset):
         self.deterministic = deterministic
         self.seed          = seed
         self.feature_dirs  = {k: Path(v) for k, v in feature_dirs.items()}
+        # Whether __getitem__ reads through the process-wide feature cache.
+        # IMPORTANT: only set this True for datasets that are small and/or
+        # accessed relatively rarely (e.g. a fixed test set evaluated once
+        # per fold), NOT for a large train/val split accessed every epoch
+        # through multiple DataLoader worker PROCESSES. Each worker process
+        # gets its own private copy-on-write memory after fork, so any
+        # caching a worker does DURING TRAINING (as opposed to caching
+        # already done in the main process before the workers were forked)
+        # is NOT shared across workers -- every worker independently grows
+        # its own copy, up to num_workers x the configured budget. On a
+        # RAM-constrained box this can trigger OS-level swapping, which is
+        # far slower than the plain uncached reads it was meant to replace.
+        # When False, __getitem__ falls back to the original per-call
+        # h5py.File(...).read(), with no cache interaction at all.
+        self.use_feature_cache = use_feature_cache
 
         # Build barcode index for each subtype directory.
         # UNI2-h filenames use full barcodes (e.g. TCGA-05-4244-01Z-00-DX1.h5)
@@ -437,9 +486,17 @@ class FiLMDataset(Dataset):
     def __getitem__(self, idx):
         rec = self.records[idx]
 
-        # In-memory cache lookup (see preload_feature_cache) instead of a
-        # fresh h5py.File(...).read() + decompress on every access.
-        features_np = _load_features_cached(rec["h5_path"])
+        if self.use_feature_cache:
+            # In-memory cache lookup (see preload_feature_cache /
+            # preload_paths) instead of a fresh h5py.File(...).read() +
+            # decompress on every access. Only safe for datasets that were
+            # marked use_feature_cache=True (see __init__ docstring note).
+            features_np = _load_features_cached(rec["h5_path"])
+        else:
+            # Original behaviour: read straight from disk every call, no
+            # cache interaction whatsoever.
+            with h5py.File(rec["h5_path"], "r") as f:
+                features_np = f["features"][:]
 
         if features_np.ndim == 3 and features_np.shape[0] == 1:
             features_np = features_np[0]
@@ -1190,25 +1247,28 @@ def train(args):
 
     log.info(f"Dev: {len(df_dev)} slides | Test: {len(df_test)} slides")
 
-    # Configure + preload the feature cache. If --feature_cache_max_gb is
-    # unset, this preserves the original uncapped behaviour (only safe if
-    # the corpus comfortably fits in RAM). If set (e.g. on a 30GB-RAM
-    # session against a much larger combined LUAD+LUSC corpus), the cache
-    # fills up to that budget and stops -- no eviction/thrashing, whatever
-    # doesn't fit is just read from disk as before. The fixed test set is
-    # prioritised first since it's re-read identically by every fold and
-    # (in the aggregator sweep) every aggregator.
+    # Configure + preload the feature cache -- ONLY for the fixed test set.
+    #
+    # Train/val deliberately do NOT use the cache (see
+    # FiLMDataset.use_feature_cache docstring): DataLoader spawns
+    # num_workers separate PROCESSES, and any caching a worker does after
+    # being forked lives in that worker's own private copy-on-write memory,
+    # not shared with the other workers. Caching the large, every-epoch
+    # dev set that way can multiply effective RAM usage by num_workers and
+    # trigger OS-level swapping -- far slower than the plain uncached reads
+    # it was meant to replace. The test set is small and evaluated only
+    # once per fold, and is warmed here in the MAIN process before any
+    # workers are forked, so it's shared safely via copy-on-write and stays
+    # fast without that risk.
     configure_feature_cache(
         max_gb=getattr(args, "feature_cache_max_gb", None),
         dtype=getattr(args, "feature_cache_dtype", "float32"),
     )
-    _test_paths_for_priority = FiLMDataset(
-        df_test, feature_dirs, gene_cols, clinical_cols
-    ).records
-    preload_feature_cache(
-        feature_dirs,
-        priority_paths=[r["h5_path"] for r in _test_paths_for_priority],
-    )
+    _test_paths = [
+        r["h5_path"] for r in
+        FiLMDataset(df_test, feature_dirs, gene_cols, clinical_cols).records
+    ]
+    preload_paths(_test_paths)
 
     # Aggregator configuration for this run (defaults preserve the original
     # AttentionMIL behaviour when these CLI flags are absent, e.g. when
@@ -1240,19 +1300,31 @@ def train(args):
         # for the transmil/graph aggregators, whose cost scales ~O(N^2) in
         # tile count, but applied uniformly across aggregators when set so
         # the comparison stays apples-to-apples on the same input bags.
+        # use_feature_cache=False for train/val: see the note above the
+        # cache preload call for why the large, every-epoch dev set
+        # deliberately bypasses the cache (avoids multi-worker-process RAM
+        # duplication / swapping). test_ds uses the cache (warmed above).
         train_ds = FiLMDataset(df_train, feature_dirs, gene_cols, clinical_cols,
-                               n_tiles=agg_max_tiles, deterministic=False)
+                               n_tiles=agg_max_tiles, deterministic=False,
+                               use_feature_cache=False)
         val_ds   = FiLMDataset(df_val,   feature_dirs, gene_cols, clinical_cols,
-                               n_tiles=agg_max_tiles, deterministic=True)
+                               n_tiles=agg_max_tiles, deterministic=True,
+                               use_feature_cache=False)
         test_ds  = FiLMDataset(df_test,  feature_dirs, gene_cols, clinical_cols,
-                               n_tiles=agg_max_tiles, deterministic=True)
+                               n_tiles=agg_max_tiles, deterministic=True,
+                               use_feature_cache=True)
 
         train_loader = DataLoader(train_ds, batch_size=1, shuffle=True,  num_workers=4,
                                   pin_memory=True, persistent_workers=True, prefetch_factor=4)
         val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, num_workers=2,
                                   pin_memory=True, persistent_workers=True, prefetch_factor=4)
-        test_loader  = DataLoader(test_ds,  batch_size=1, shuffle=False, num_workers=2,
-                                  pin_memory=True, persistent_workers=True, prefetch_factor=4)
+        # num_workers=0 (main process only) for the test loader: test_ds is
+        # already fully warmed in the cache before this point, so there's
+        # nothing for a worker process to gain from parallel disk reads,
+        # and running it in-process avoids even the small residual risk of
+        # a worker privately caching a not-yet-cached test slide (e.g. if
+        # the test set didn't fully fit the configured budget).
+        test_loader  = DataLoader(test_ds,  batch_size=1, shuffle=False, num_workers=0)
 
         # Model
         model    = FiLMMILModel(
