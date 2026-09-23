@@ -42,8 +42,21 @@ __pycache__/
 .DS_Store
 
 # Results (keep json summaries but not model weights)
-results/FiLM/training/*.pt
-results/no-FiLM/training/*.pt
+results/no-FiLM/nofilmABMILseed96/*.json
+results/no-FiLM/nofilmABMILseed96/*.csv
+results/no-FiLM/nofilmABMILseed96/*.npz
+
+results/no-FiLM/nofilmCLAMseed96/*.json
+results/no-FiLM/nofilmCLAMseed96/*.csv
+results/no-FiLM/nofilmCLAMseed96/*.npz
+
+results/no-FiLM/nofilmTRANSMILseed96/*.json
+results/no-FiLM/nofilmTRANSMILseed96/*.csv
+results/no-FiLM/nofilmTRANSMILseed96/*.npz
+
+results/no-FiLM/architecture_comparison_files_seed96
+
+results/no-FiLM/architecture_comparison_output_seed96
 
 # Verification scripts
 src/hidden-verification/*.py
