@@ -908,8 +908,12 @@ class FiLMMILModel(nn.Module):
         transmil_layers: int = 2,
         transmil_dim_feedforward: int = 512,
         attention_temperature: float = 1.0,
+        tile_dropout: float = 0.0,
     ):
         super().__init__()
+        if not 0.0 <= float(tile_dropout) < 1.0:
+            raise ValueError("tile_dropout must be in [0, 1)")
+        self.tile_dropout = float(tile_dropout)
 
         #1. Check if FiLM conditioning is enabled
         self.use_film = use_film
@@ -972,7 +976,18 @@ class FiLMMILModel(nn.Module):
         returns    : predictions (n_genes,), attn_weights (N_tiles,),
                      panel_preds (2,) or None if use_panel_head=False
         """
-        # 1. Attention pooling -> slide embedding
+        # 1. Optional training-time tile dropout. Randomly remove a fraction
+        # of tiles from the current bag before MIL aggregation. This is only
+        # active in model.train(); validation/test use the full deterministic bag.
+        if self.training and self.tile_dropout > 0.0:
+            n_tiles = features.shape[0]
+            keep_prob = 1.0 - self.tile_dropout
+            keep_mask = torch.rand(n_tiles, device=features.device) < keep_prob
+            if not bool(keep_mask.any()):
+                keep_mask[torch.randint(0, n_tiles, (1,), device=features.device)] = True
+            features = features[keep_mask]
+
+        # 1b. Attention pooling -> slide embedding
         slide_embed, attn_weights = self.attention_mil(features)  # (512,), (N,)
 
         # 2. FiLM conditioning on subtype
@@ -1295,8 +1310,11 @@ def train(args):
     transmil_layers = getattr(args, "transmil_layers", 2)
     transmil_dim_feedforward = getattr(args, "transmil_dim_feedforward", 512)
     attention_temperature = getattr(args, "attention_temperature", 1.0)
+    tile_dropout = getattr(args, "tile_dropout", 0.0)
     log.info(f"Aggregator: {aggregator}"
              + (f" (agg_max_tiles={agg_max_tiles})" if agg_max_tiles else ""))
+    log.info(f"Attention temperature: {attention_temperature:.3g}")
+    log.info(f"Training tile dropout: {tile_dropout:.3g}")
 
     # 5-fold cross validation
     kf = KFold(n_splits=args.n_folds, shuffle=True, random_state=kfold_seed)
@@ -1351,6 +1369,7 @@ def train(args):
             transmil_heads=transmil_heads, transmil_layers=transmil_layers,
             transmil_dim_feedforward=transmil_dim_feedforward,
             attention_temperature=attention_temperature,
+            tile_dropout=tile_dropout,
         ).to(device)
         loss_fn  = CompositeLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
@@ -1468,6 +1487,8 @@ def train(args):
             "subtype":        subtype_results,
             "use_film": args.use_film,
             "aggregator": aggregator,
+            "attention_temperature": float(attention_temperature),
+            "tile_dropout": float(tile_dropout),
         }
         fold_results.append(fold_result)
 
@@ -1572,6 +1593,7 @@ def run_sweep(args):
                 transmil_layers=getattr(args, "transmil_layers", 2),
                 transmil_dim_feedforward=getattr(args, "transmil_dim_feedforward", 512),
                 attention_temperature=getattr(args, "attention_temperature", 1.0),
+                tile_dropout=getattr(args, "tile_dropout", 0.0),
             ).parameters()
         )
         row["n_params"] = n_params
@@ -1656,6 +1678,8 @@ def parse_args():
                    help="[transmil aggregator] Transformer feed-forward width.")
     p.add_argument("--attention_temperature", type=float, default=1.0,
                    help="Temperature applied to ABMIL/CLAM attention logits. >1 softens attention; <1 sharpens it. Default 1.0 preserves existing behaviour.")
+    p.add_argument("--tile_dropout", type=float, default=0.0,
+                   help="Fraction of tiles randomly dropped from each training bag before MIL pooling. Applied only during model.train(); validation/test use the complete input bag. Default 0.0 preserves existing behaviour.")
 
     # Feature cache (RAM-budget control for large corpora)
     p.add_argument("--feature_cache_max_gb", type=float, default=None,
