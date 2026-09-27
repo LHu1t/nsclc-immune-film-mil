@@ -538,8 +538,12 @@ class AttentionMIL(nn.Module):
     Learns which tiles matter most for the prediction.
     Outputs a single slide-level embedding + attention weights for visualisation.
     """
-    def __init__(self, feat_dim: int = 1536, hidden_dim: int = 256):
+    def __init__(self, feat_dim: int = 1536, hidden_dim: int = 256,
+                 attention_temperature: float = 1.0):
         super().__init__()
+        if attention_temperature <= 0:
+            raise ValueError("attention_temperature must be > 0")
+        self.attention_temperature = float(attention_temperature)
         self.attention = nn.Sequential(
             nn.Linear(feat_dim, hidden_dim),
             nn.Tanh(),
@@ -562,7 +566,7 @@ class AttentionMIL(nn.Module):
         )
         projected = self.feat_proj(features)            # (N, 512)
         raw_attn  = self.attention(features)            # (N, 1)
-        attn      = torch.softmax(raw_attn, dim=0)     # (N, 1)  sums to 1
+        attn      = torch.softmax(raw_attn / self.attention_temperature, dim=0)
         slide_embed = (attn * projected).sum(dim=0)    # (512,)
         return slide_embed, attn.squeeze(-1)            # (512,), (N,)
 
@@ -600,8 +604,12 @@ class CLAMGatedAttentionMIL(nn.Module):
     against AttentionMIL/TransMIL/graph-MIL — the axis this sweep tests.
     """
     def __init__(self, feat_dim: int = 1536, hidden_dim: int = 256,
-                 embed_dim: int = 512, dropout: float = 0.25):
+                 embed_dim: int = 512, dropout: float = 0.25,
+                 attention_temperature: float = 1.0):
         super().__init__()
+        if attention_temperature <= 0:
+            raise ValueError("attention_temperature must be > 0")
+        self.attention_temperature = float(attention_temperature)
         self.attention_V = nn.Sequential(nn.Linear(feat_dim, hidden_dim), nn.Tanh())
         self.attention_U = nn.Sequential(nn.Linear(feat_dim, hidden_dim), nn.Sigmoid())
         self.attention_w = nn.Linear(hidden_dim, 1)
@@ -624,7 +632,7 @@ class CLAMGatedAttentionMIL(nn.Module):
         gated_logits = self.attention_w(
             self.attention_V(features) * self.attention_U(features)
         )                                                            # (N, 1)
-        attn = torch.softmax(gated_logits, dim=0)                   # (N, 1) sums to 1
+        attn = torch.softmax(gated_logits / self.attention_temperature, dim=0)
         slide_embed = (attn * projected).sum(dim=0)                 # (embed_dim,)
         return slide_embed, attn.squeeze(-1)
 
@@ -773,7 +781,7 @@ AGGREGATOR_CHOICES = ["abmil", "clam", "transmil", "graph"]
 
 def build_aggregator(name: str, feat_dim: int, embed_dim: int,
                       hidden_dim: int = 256, dropout: float = 0.25,
-                      **kwargs) -> nn.Module:
+                      attention_temperature: float = 1.0, **kwargs) -> nn.Module:
     """
     Factory for the aggregator-architecture robustness sweep. Every
     aggregator below shares the exact same interface:
@@ -793,10 +801,14 @@ def build_aggregator(name: str, feat_dim: int, embed_dim: int,
     """
     name = name.lower()
     if name == "abmil":
-        return AttentionMIL(feat_dim=feat_dim, hidden_dim=hidden_dim)
+        return AttentionMIL(
+            feat_dim=feat_dim, hidden_dim=hidden_dim,
+            attention_temperature=attention_temperature,
+        )
     elif name == "clam":
         return CLAMGatedAttentionMIL(
-            feat_dim=feat_dim, hidden_dim=hidden_dim, embed_dim=embed_dim, dropout=dropout,
+            feat_dim=feat_dim, hidden_dim=hidden_dim, embed_dim=embed_dim,
+            dropout=dropout, attention_temperature=attention_temperature,
         )
     elif name == "transmil":
         return TransMILAggregator(
@@ -898,6 +910,7 @@ class FiLMMILModel(nn.Module):
         transmil_heads: int = 8,
         transmil_layers: int = 2,
         transmil_dim_feedforward: int = 512,
+        attention_temperature: float = 1.0,
     ):
         super().__init__()
 
@@ -923,6 +936,7 @@ class FiLMMILModel(nn.Module):
             transmil_heads=transmil_heads,
             transmil_layers=transmil_layers,
             transmil_dim_feedforward=transmil_dim_feedforward,
+            attention_temperature=attention_temperature,
         )
 
         # 3. FiLM subtype conditioning
@@ -1281,7 +1295,11 @@ def train(args):
     transmil_heads = getattr(args, "transmil_heads", 8)
     transmil_layers = getattr(args, "transmil_layers", 2)
     transmil_dim_feedforward = getattr(args, "transmil_dim_feedforward", 512)
+    attention_temperature = float(getattr(args, "attention_temperature", 1.0))
+    if attention_temperature <= 0:
+        raise ValueError("attention_temperature must be > 0")
     log.info(f"Aggregator: {aggregator}"
+             + (f" | attention_temperature={attention_temperature:g}" if aggregator in {"abmil", "clam"} else "")
              + (f" (agg_max_tiles={agg_max_tiles})" if agg_max_tiles else ""))
 
     # 5-fold cross validation
@@ -1333,6 +1351,7 @@ def train(args):
             graph_k=graph_k, graph_layers=graph_layers,
             transmil_heads=transmil_heads, transmil_layers=transmil_layers,
             transmil_dim_feedforward=transmil_dim_feedforward,
+            attention_temperature=attention_temperature,
         ).to(device)
         loss_fn  = CompositeLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
@@ -1450,6 +1469,7 @@ def train(args):
             "subtype":        subtype_results,
             "use_film": args.use_film,
             "aggregator": aggregator,
+            "attention_temperature": attention_temperature,
         }
         fold_results.append(fold_result)
 
@@ -1537,7 +1557,8 @@ def run_sweep(args):
         fold_results = train(run_args)
         all_fold_results[agg] = fold_results
 
-        row = {"aggregator": agg, "n_folds": len(fold_results)}
+        row = {"aggregator": agg, "n_folds": len(fold_results),
+               "attention_temperature": getattr(args, "attention_temperature", 1.0)}
         for metric in metrics:
             vals = [r[metric] for r in fold_results if r.get(metric) is not None]
             if vals:
@@ -1553,6 +1574,7 @@ def run_sweep(args):
                 transmil_heads=getattr(args, "transmil_heads", 8),
                 transmil_layers=getattr(args, "transmil_layers", 2),
                 transmil_dim_feedforward=getattr(args, "transmil_dim_feedforward", 512),
+                attention_temperature=getattr(args, "attention_temperature", 1.0),
             ).parameters()
         )
         row["n_params"] = n_params
@@ -1606,6 +1628,10 @@ def parse_args():
                    help="MIL pooling/aggregation architecture applied to the frozen "
                         "UNI2-h tile embeddings, below FiLM/clinical/heads. "
                         f"Choices: {AGGREGATOR_CHOICES}.")
+    p.add_argument("--attention_temperature", type=float, default=1.0,
+                   help="Softmax temperature applied to ABMIL/CLAM attention logits during training. "
+                        "1.0 preserves historical behaviour; <1 sharpens attention; >1 flattens it. "
+                        "Ignored by TransMIL/graph.")
     p.add_argument("--aggregator_sweep", default=None,
                    help="Comma-separated list of aggregators (e.g. "
                         "'abmil,clam,transmil,graph') to run the full training "
